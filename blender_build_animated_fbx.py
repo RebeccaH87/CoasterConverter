@@ -17,12 +17,23 @@ import bpy
 from mathutils import Matrix, Vector
 
 
-def load_samples(bundle_path: Path):
+def load_bundle(bundle_path: Path):
     data = json.loads(bundle_path.read_text(encoding="utf-8"))
     samples = data.get("samples", [])
     if not samples:
         raise RuntimeError("Bundle contains no samples")
-    return samples
+
+    # "samples" carries the un-edited analytic path that the physics timeline
+    # was derived from. "render_path" is the spike-filtered copy and is the only
+    # one safe to build display geometry from. Older v1 bundles have no
+    # render_path, in which case samples are all we have.
+    render_path = data.get("render_path") or samples
+    if len(render_path) != len(samples):
+        print(
+            f"WARNING: render_path has {len(render_path)} points but samples has "
+            f"{len(samples)}. Using render_path for geometry regardless."
+        )
+    return data, samples, render_path
 
 
 def make_rotation_from_tangent_up(tangent, up):
@@ -166,7 +177,7 @@ def world_bounds_size(objects):
     return max_v - min_v
 
 
-def try_import_cart_model(cart_model_path: Path, cart_scale: float):
+def try_import_cart_model(cart_model_path: Path, cart_scale: float, fit_mode: str, target_length_m: float):
     importer = getattr(bpy.ops.import_scene, "gltf", None)
     if importer is None or not cart_model_path.exists():
         return None
@@ -194,24 +205,82 @@ def try_import_cart_model(cart_model_path: Path, cart_scale: float):
     for obj in imported_roots:
         obj.parent = visual_root
 
-    # Normalize arbitrary GLB authoring scale to the same nominal cart length
-    # as the built-in placeholder, then apply user cart_scale as a true multiplier.
-    placeholder_length_m = 0.9
     bounds = world_bounds_size(mesh_objs)
+    max_dim = max(bounds.x, bounds.y, bounds.z) if bounds is not None else 0.0
+
+    # "preserve" keeps the model's authored real-world size, so a 4.5m car
+    # imports as 4.5m. Forcing every model to a fixed nominal length destroys
+    # real-world scale, which is exactly what has to stay correct here, so
+    # "normalize" is opt-in for models authored in arbitrary units.
     normalize = 1.0
-    if bounds is not None:
-        max_dim = max(bounds.x, bounds.y, bounds.z)
+    if fit_mode == "normalize":
         if max_dim > 1.0e-6:
-            normalize = placeholder_length_m / max_dim
+            normalize = max(target_length_m, 1.0e-6) / max_dim
+    elif fit_mode != "preserve":
+        raise RuntimeError(f"Unknown cart fit mode: {fit_mode}")
 
     final_scale = max(cart_scale, 0.01) * normalize
     visual_root.scale = (final_scale, final_scale, final_scale)
+
     print(
-        f"Imported cart model: {cart_model_path} | normalize={normalize:.5f} "
-        f"cart_scale={cart_scale:.3f} final_scale={final_scale:.5f}"
+        f"Imported cart model: {cart_model_path}"
     )
+    print(
+        f"  fit_mode={fit_mode} authored_max_dim={max_dim:.3f}m "
+        f"normalize={normalize:.5f} cart_scale={cart_scale:.3f} "
+        f"final_scale={final_scale:.5f}"
+    )
+    if max_dim > 1.0e-6:
+        print(f"  resulting cart length: {max_dim * final_scale:.3f} m")
+    if fit_mode == "preserve" and abs(cart_scale - 1.0) > 1e-6:
+        print(
+            f"  NOTE: cart_scale={cart_scale:.3f} != 1.0, so the cart is no "
+            "longer at its authored real-world size."
+        )
 
     return visual_root
+
+
+def build_calibration_cube(edge_m: float, samples):
+    """A cube of exactly known size, so the delivered scale can be asserted in UE.
+
+    The converter can verify its own output against a reference path, but it
+    cannot see what the FBX importer does to units. This cube travels through
+    the same export and import as the track, under the same root transform, so
+    measuring it in Unreal measures the whole chain end to end.
+    """
+    if edge_m <= 0.0:
+        return None
+
+    xs = [s["pos_m"][0] for s in samples]
+    ys = [s["pos_m"][1] for s in samples]
+    zs = [s["pos_m"][2] for s in samples]
+
+    # Park it clear of the track so it never intersects the geometry.
+    origin = Vector((min(xs) - edge_m * 3.0, min(ys), min(zs) - edge_m * 3.0))
+
+    h = edge_m * 0.5
+    verts = [
+        (-h, -h, -h), (h, -h, -h), (h, h, -h), (-h, h, -h),
+        (-h, -h, h), (h, -h, h), (h, h, h), (-h, h, h),
+    ]
+    faces = [
+        (0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+        (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
+    ]
+
+    mesh = bpy.data.meshes.new("CoasterScaleRefMesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+
+    # The expected size is encoded in the name so the UE-side check needs no
+    # out-of-band knowledge of what it is measuring.
+    name = f"CoasterScaleRef_{int(round(edge_m * 1000.0))}mm"
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    obj.location = origin
+    print(f"Added scale calibration cube '{name}': {edge_m:.4f} m edge at {origin[:]}")
+    return obj
 
 
 def build_fallback_track_mesh(samples):
@@ -394,10 +463,20 @@ def try_import_3ds(mesh_path: Path) -> bool:
         return False
 
 
-def build_animation(samples, fps, speed_multiplier, cart_scale, cart_model_path: Path | None):
+def build_animation(
+    samples,
+    fps,
+    speed_multiplier,
+    cart_scale,
+    cart_model_path: Path | None,
+    cart_fit_mode: str = "preserve",
+    cart_target_length_m: float = 0.9,
+):
     cart = None
     if cart_model_path is not None:
-        cart = try_import_cart_model(cart_model_path, cart_scale)
+        cart = try_import_cart_model(
+            cart_model_path, cart_scale, cart_fit_mode, cart_target_length_m
+        )
     if cart is None:
         cart = build_rider_mesh_object(cart_scale)
 
@@ -418,8 +497,19 @@ def build_animation(samples, fps, speed_multiplier, cart_scale, cart_model_path:
         cart.keyframe_insert(data_path="rotation_euler", frame=frame)
 
     scene = bpy.context.scene
+    # Blender's FBX exporter converts frame numbers to seconds using the scene
+    # render fps, NOT the spacing the keys were authored at. Leaving this at the
+    # factory default of 24 makes the FBX declare a ride that lasts fps/24 times
+    # too long, which scales every acceleration by (24/fps)^2. It must match the
+    # rate the keys were written at.
+    scene.render.fps = int(round(fps))
+    scene.render.fps_base = 1.0
     scene.frame_start = start_frame
     scene.frame_end = end_frame
+    print(
+        f"Scene timing: {scene.render.fps}fps, frames {start_frame}..{end_frame} "
+        f"= {(end_frame - start_frame) / float(scene.render.fps):.2f}s"
+    )
 
     apply_linear_interpolation(cart)
     return cart
@@ -433,10 +523,31 @@ def main():
     parser.add_argument("--track-out")
     parser.add_argument("--cart-out")
     parser.add_argument("--cart-model")
-    parser.add_argument("--fps", type=int, default=30)
+    # 120fps, not 30. Position keys are linear, so acceleration inside a key
+    # interval is zero and the whole second derivative lives in the joints
+    # between keys. The analyzer fits a quadratic over a 0.15s window; at 30fps
+    # that window holds ~4 keys, which cannot resolve a G peak. At 120fps it
+    # holds ~18. Linear interpolation is kept deliberately - at this key density
+    # it is accurate, and Bezier would overshoot on tight curvature.
+    parser.add_argument("--fps", type=int, default=120)
     parser.add_argument("--speed-multiplier", type=float, default=1.0)
     parser.add_argument("--scale-multiplier", type=float, default=1.0)
-    parser.add_argument("--cart-scale", type=float, default=2.5)
+    parser.add_argument("--cart-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--cart-fit-mode",
+        choices=["preserve", "normalize"],
+        default="preserve",
+        help="preserve: keep the model's authored real-world size (default). "
+             "normalize: rescale its longest axis to --cart-target-length.",
+    )
+    parser.add_argument("--cart-target-length", type=float, default=0.9)
+    parser.add_argument(
+        "--calibration-cube-m",
+        type=float,
+        default=1.0,
+        help="Edge length in metres of a known-size cube added to the track FBX "
+             "so import scale can be asserted in Unreal. 0 disables it.",
+    )
     parser.add_argument("--root-rot-x-deg", type=float, default=90.0)
     argv = sys.argv
     if "--" in argv:
@@ -468,7 +579,28 @@ def main():
     # Reset scene.
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
-    samples = load_samples(bundle_path)
+    # Both multipliers silently corrupt any force derived from the animation.
+    # Position scales linearly with scale_multiplier, and time scales inversely
+    # with speed_multiplier, so acceleration goes as scale/speed^2.
+    if abs(args.scale_multiplier - 1.0) > 1e-6 or abs(args.speed_multiplier - 1.0) > 1e-6:
+        factor = args.scale_multiplier / (args.speed_multiplier ** 2)
+        print("=" * 72)
+        print("WARNING: PHYSICS ACCURACY COMPROMISED")
+        print(f"  scale_multiplier = {args.scale_multiplier}  (world size x{args.scale_multiplier})")
+        print(f"  speed_multiplier = {args.speed_multiplier}  (time x{1.0 / args.speed_multiplier:.4f})")
+        print(f"  => every acceleration and G-force reading will be x{factor:.4f}")
+        print("  Set both to 1.0 for physically accurate output.")
+        print("=" * 72)
+
+    bundle_data, samples, render_path = load_bundle(bundle_path)
+    cleanup = (bundle_data.get("cleanup") or {})
+    if cleanup.get("applies_to") != "render_path" and cleanup.get("spike_filter_enabled"):
+        print(
+            "WARNING: this bundle was produced by an older converter that applied "
+            "the spike filter to the analytic path. Its physics timeline contains "
+            "smoothing artifacts. Re-run the converter to fix."
+        )
+
     track_root = create_root_node(args.scale_multiplier, args.root_rot_x_deg)
     track_root.name = "CoasterTrackRoot"
 
@@ -476,7 +608,8 @@ def main():
     imported = try_import_3ds(mesh_path)
     if not imported:
         print("WARNING: Blender 3DS importer is unavailable. Building fallback track mesh from sampled path.")
-        build_fallback_track_mesh(samples)
+        build_fallback_track_mesh(render_path)
+    build_calibration_cube(args.calibration_cube_m, render_path)
     post_import_objs = [o for o in bpy.context.scene.objects if o not in pre_import_objs]
     parent_objects_to_root(post_import_objs, track_root)
 
@@ -489,6 +622,12 @@ def main():
         args.speed_multiplier,
         max(args.cart_scale, 0.01),
         cart_model_path,
+        args.cart_fit_mode,
+        args.cart_target_length,
+    )
+    print(
+        f"Baked {args.fps}fps keys over {float(samples[-1]['time_s']):.2f}s "
+        f"of ride time ({len(samples)} analytic samples)"
     )
     rider.parent = cart_root
 
