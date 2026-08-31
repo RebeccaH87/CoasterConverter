@@ -17,9 +17,10 @@ import json
 import math
 import struct
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -91,6 +92,405 @@ def parse_nlelem(path: Path) -> NLElemData:
         offset += 50
 
     return NLElemData(path=path, data_length=data_length, node_count=node_count, nodes=nodes)
+
+
+@dataclass
+class NL2RollFrame:
+    """One banking frame from a .nl2elem file.
+
+    up and right are orthonormal, and both are perpendicular to the track, so
+    the travel direction is up x right. coord runs 0..1 along the element.
+    """
+
+    coord: float
+    up: Tuple[float, float, float]
+    right: Tuple[float, float, float]
+
+    def tangent(self) -> Tuple[float, float, float]:
+        return v_norm(cross(self.up, self.right))
+
+
+def parse_nl2elem(path: Path) -> Tuple[NLElemData, List[NL2RollFrame], str]:
+    """Parse NoLimits 2's XML element format.
+
+    This format is self-contained: one file carries both the path and the
+    banking, so no companion tangent file is needed.
+
+    Reverse-engineered from a sample, with the reasoning recorded because none
+    of it is documented:
+
+    * The vertex count is an exact multiple of three, and reading each triple as
+      absolute cubic Bezier control points (kp1, kp2, endpoint) - the layout the
+      older binary .nlelem uses - fits the banking frames far better than any
+      alternative tried: median tangent error 10.8 degrees, against 27 to 49 for
+      relative offsets, swapped controls, or a spline through the vertices.
+    * roll gives an orthonormal (up, right) pair. Both measured about 90 degrees
+      from the path tangent, which is what identifies up x right as travel.
+    * coord is treated as normalised arc length. It is 0 at the first frame and
+      1 at the last, and both endpoints reproduce the tangent to 0.1 degrees,
+      but the middle is only approximate. The converter reports the residual.
+    """
+    root = ET.parse(path).getroot()
+    element = root.find("element")
+    if element is None:
+        raise ValueError(f"{path} has no <element>; is it a NoLimits 2 element file?")
+
+    description = (element.findtext("description") or "").strip()
+
+    coords: List[Tuple[float, float, float]] = []
+    for vertex in element.findall("vertex"):
+        try:
+            coords.append(
+                (
+                    float(vertex.findtext("x")),
+                    float(vertex.findtext("y")),
+                    float(vertex.findtext("z")),
+                )
+            )
+        except (TypeError, ValueError) as ex:
+            raise ValueError(f"{path} has a malformed vertex: {ex}") from None
+
+    if len(coords) < 3:
+        raise ValueError(f"{path} has only {len(coords)} vertices; need at least 3")
+    if len(coords) % 3 != 0:
+        raise ValueError(
+            f"{path} has {len(coords)} vertices, which is not a multiple of three. "
+            "This reader expects absolute Bezier triples (kp1, kp2, endpoint)."
+        )
+
+    nodes: List[NLElemNode] = []
+    for i in range(len(coords) // 3):
+        kp1, kp2, p1 = coords[i * 3], coords[i * 3 + 1], coords[i * 3 + 2]
+        nodes.append(
+            NLElemNode(
+                kp1=kp1,
+                kp2=kp2,
+                p1=p1,
+                roll=0.0,
+                cont_roll=0,
+                rel_roll=0,
+                equal_dist_cp=0,
+            )
+        )
+
+    frames: List[NL2RollFrame] = []
+    for roll in element.findall("roll"):
+        try:
+            up = (
+                float(roll.findtext("ux")),
+                float(roll.findtext("uy")),
+                float(roll.findtext("uz")),
+            )
+            right = (
+                float(roll.findtext("rx")),
+                float(roll.findtext("ry")),
+                float(roll.findtext("rz")),
+            )
+            coord = float(roll.findtext("coord"))
+        except (TypeError, ValueError) as ex:
+            raise ValueError(f"{path} has a malformed roll: {ex}") from None
+        frames.append(NL2RollFrame(coord=coord, up=v_norm(up), right=v_norm(right)))
+
+    # Frames are not stored in coord order in the files seen so far.
+    frames.sort(key=lambda f: f.coord)
+
+    data = NLElemData(
+        path=path,
+        data_length=len(coords) * 3,
+        node_count=len(nodes),
+        nodes=nodes,
+    )
+    return data, frames, description
+
+
+def _slerp(a, b, t):
+    """Interpolate between two unit vectors along the arc, not the chord.
+
+    Straight interpolation shortens and skews the up vector through the large
+    swings between banking frames; the arc keeps it unit length.
+    """
+    d = max(-1.0, min(1.0, dot(a, b)))
+    if d > 0.9995:
+        return v_norm(v_lerp(a, b, t))
+    theta = math.acos(d)
+    sin_theta = math.sin(theta)
+    w_a = math.sin((1.0 - t) * theta) / sin_theta
+    w_b = math.sin(t * theta) / sin_theta
+    return v_norm(v_add(v_mul(a, w_a), v_mul(b, w_b)))
+
+
+def apply_nl2_roll_frames(
+    samples: List[Dict], frames: List[NL2RollFrame], axis_mapping: str
+) -> None:
+    """Bank the sampled path using the file's own roll frames.
+
+    The up vector comes straight from the frames rather than being rebuilt from
+    a roll angle, then is made perpendicular to the local tangent. roll_rad is
+    filled in afterwards for the record only.
+    """
+    if not samples or not frames:
+        return
+
+    cum = cumulative_arclength(samples)
+    total = cum[-1]
+    if total < 1e-9:
+        return
+
+    coords = [f.coord for f in frames]
+    cursor = 0
+    for i, row in enumerate(samples):
+        s = cum[i] / total
+        while cursor < len(coords) - 2 and coords[cursor + 1] < s:
+            cursor += 1
+
+        lo = frames[cursor]
+        hi = frames[min(cursor + 1, len(frames) - 1)]
+        span = hi.coord - lo.coord
+        t = 0.0 if span <= 1e-12 else max(0.0, min(1.0, (s - lo.coord) / span))
+        up = _slerp(lo.up, hi.up, t)
+
+        tan = tuple(row["tan"])
+        # Strip any component along the track so the frame stays orthonormal.
+        up = v_sub(up, v_mul(tan, dot(up, tan)))
+        if v_len(up) < 1e-6:
+            up = tuple(row["up"])
+        up = v_norm(up)
+
+        world_up = (0.0, 1.0, 0.0)
+        natural_right = cross(tan, world_up)
+        if v_len(natural_right) < 1e-6:
+            natural_right = (1.0, 0.0, 0.0)
+        natural_up = v_norm(cross(v_norm(natural_right), tan))
+
+        # Signed angle from the unbanked up to the banked one, about the track.
+        cos_roll = max(-1.0, min(1.0, dot(natural_up, up)))
+        sin_roll = dot(cross(natural_up, up), tan)
+        row["roll_rad"] = math.atan2(sin_roll, cos_roll)
+
+        row["up"] = [up[0], up[1], up[2]]
+        row["ue_up"] = list(to_ue_dir(up, axis_mapping))
+        row["ue_tan"] = list(to_ue_dir(tan, axis_mapping))
+        row["ue_pos_cm"] = list(to_ue_cm(tuple(row["pos_m"]), axis_mapping))
+        row["ue_tan_cm"] = list(v_mul(to_ue_cm(tan, axis_mapping), 1.0))
+
+
+def nl2_frame_residual(samples: List[Dict], frames: List[NL2RollFrame]) -> Dict:
+    """Angle between the path tangent and each frame's own travel direction.
+
+    A direct measure of how well the reconstructed path agrees with the file's
+    banking data, and the honest bound on this reader's accuracy.
+    """
+    if not samples or not frames:
+        return {}
+
+    cum = cumulative_arclength(samples)
+    total = cum[-1]
+    if total < 1e-9:
+        return {}
+
+    errors = []
+    for frame in frames:
+        target = total * max(0.0, min(1.0, frame.coord))
+        idx = 0
+        while idx < len(cum) - 2 and cum[idx + 1] < target:
+            idx += 1
+        tan = tuple(samples[idx]["tan"])
+        # Sign-agnostic: a reversed tangent is a direction convention, not error.
+        d = abs(max(-1.0, min(1.0, dot(frame.tangent(), tan))))
+        errors.append(math.degrees(math.acos(d)))
+
+    errors.sort()
+
+    def pct(q):
+        return errors[min(len(errors) - 1, max(0, int(round(q * (len(errors) - 1)))))]
+
+    return {
+        "frames": len(errors),
+        "median_deg": pct(0.5),
+        "p90_deg": pct(0.9),
+        "max_deg": errors[-1],
+    }
+
+
+NL2_CSV_COLUMNS = (
+    "PosX", "PosY", "PosZ",
+    "FrontX", "FrontY", "FrontZ",
+    "UpX", "UpY", "UpZ",
+)
+
+
+def parse_nl2_spline_csv(path: Path, axis_mapping: str) -> Tuple[List[Dict], str]:
+    """Read NoLimits 2's spline CSV export straight into sampled stations.
+
+    This is the best input the pipeline takes. Unlike the element formats it is
+    already fully resolved: every row carries a position and a complete
+    orthonormal frame (Front, Left, Up), so there is no spline basis to guess at
+    and no roll parameterisation to infer. Nothing is reconstructed.
+
+    Tab-separated with quoted headers, positions in metres, Y up - the same
+    convention as the binary and XML element formats.
+    """
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise ValueError(f"{path} has too few rows to be a spline export")
+
+    def split(line):
+        parts = line.split("\t")
+        if len(parts) < 4:
+            # Some exports use commas or semicolons instead of tabs.
+            for sep in (";", ","):
+                if line.count(sep) >= 3:
+                    parts = line.split(sep)
+                    break
+        return [c.strip().strip('"').strip() for c in parts]
+
+    header = split(lines[0])
+    missing = [c for c in NL2_CSV_COLUMNS if c not in header]
+    if missing:
+        raise ValueError(
+            f"{path} is missing required column(s) {missing}. Expected a "
+            "NoLimits 2 spline export with Pos/Front/Up columns; got "
+            f"{header[:14]}"
+        )
+    index_of = {name: header.index(name) for name in NL2_CSV_COLUMNS}
+
+    samples: List[Dict] = []
+    for row_number, line in enumerate(lines[1:], start=2):
+        cells = split(line)
+        if len(cells) < len(header):
+            continue
+        try:
+            values = {name: float(cells[i]) for name, i in index_of.items()}
+        except ValueError:
+            # Trailing notes or blank rows are common; skip rather than fail.
+            continue
+
+        pos = (values["PosX"], values["PosY"], values["PosZ"])
+        tan = v_norm((values["FrontX"], values["FrontY"], values["FrontZ"]))
+        up = v_norm((values["UpX"], values["UpY"], values["UpZ"]))
+
+        # Make up exactly perpendicular to the tangent. The export is already
+        # orthonormal to about 1e-6, but the physics assumes it exactly.
+        up = v_sub(up, v_mul(tan, dot(up, tan)))
+        if v_len(up) < 1e-6:
+            up = (0.0, 1.0, 0.0)
+        up = v_norm(up)
+
+        samples.append(
+            {
+                "index": len(samples),
+                "segment": 0,
+                "t": 0.0,
+                "pos_m": [pos[0], pos[1], pos[2]],
+                "tan": [tan[0], tan[1], tan[2]],
+                "up": [up[0], up[1], up[2]],
+                "roll_rad": 0.0,
+                "ue_pos_cm": list(to_ue_cm(pos, axis_mapping)),
+                "ue_tan_cm": list(v_mul(to_ue_cm(tan, axis_mapping), 1.0)),
+                "ue_tan": list(to_ue_dir(tan, axis_mapping)),
+                "ue_up": list(to_ue_dir(up, axis_mapping)),
+            }
+        )
+
+    if len(samples) < 3:
+        raise ValueError(f"{path} yielded only {len(samples)} usable rows")
+
+    # roll_rad is recorded for reference; the up vectors above are authoritative.
+    for row in samples:
+        tan = tuple(row["tan"])
+        up = tuple(row["up"])
+        natural_right = cross(tan, (0.0, 1.0, 0.0))
+        if v_len(natural_right) < 1e-6:
+            natural_right = (1.0, 0.0, 0.0)
+        natural_up = v_norm(cross(v_norm(natural_right), tan))
+        row["roll_rad"] = math.atan2(
+            dot(cross(natural_up, up), tan),
+            max(-1.0, min(1.0, dot(natural_up, up))),
+        )
+
+    return samples, f"NoLimits 2 spline export, {len(samples)} stations"
+
+
+def detect_sample_gaps(samples: List[Dict], threshold_multiple: float = 6.0) -> List[Dict]:
+    """Find jumps in an already-resolved station list.
+
+    The element formats are checked for defects through their Bezier control
+    points, which a resolved export does not have. Spacing is the equivalent
+    signal: a station much further from its predecessor than the rest means the
+    export skipped track.
+    """
+    if len(samples) < 8:
+        return []
+
+    steps = [
+        v_len(v_sub(tuple(samples[i]["pos_m"]), tuple(samples[i - 1]["pos_m"])))
+        for i in range(1, len(samples))
+    ]
+    ordered = sorted(steps)
+    median = ordered[len(ordered) // 2]
+    if median < 1e-9:
+        return []
+
+    limit = median * threshold_multiple
+    gaps = []
+    for i, step in enumerate(steps):
+        if step > limit:
+            gaps.append(
+                {
+                    "node_index": i + 1,
+                    "gap_m": step,
+                    "median_spacing_m": median,
+                    "ratio": step / median,
+                    "kind": "missing_track",
+                }
+            )
+    return gaps
+
+
+def csv_looks_like_nl2_spline(path: Path) -> bool:
+    """Cheap header sniff, so a stray CSV is not mistaken for a spline export."""
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+            head = handle.readline()
+    except OSError:
+        return False
+    cleaned = head.replace(chr(34), "")
+    return all(name in cleaned for name in ("PosX", "FrontX", "UpX"))
+
+
+def find_sibling_spline_csv(elem_path: Path, description: str) -> Optional[Path]:
+    """Look for the spline CSV NoLimits 2 exports alongside an element.
+
+    Worth doing because that CSV is fully resolved: preferring it turns a
+    reconstruction of unknown accuracy into an exact result, and the user does
+    not have to know the difference. The element's own description is checked
+    first, since NoLimits names the CSV after the track rather than after the
+    element file.
+    """
+    folder = elem_path.parent
+    candidates = []
+    if description:
+        candidates.append(folder / f"{description}Spline.csv")
+        candidates.append(folder / f"{description}.csv")
+    candidates.append(folder / f"{elem_path.stem}Spline.csv")
+    candidates.append(folder / f"{elem_path.stem}.csv")
+
+    for candidate in candidates:
+        if candidate.is_file() and csv_looks_like_nl2_spline(candidate):
+            return candidate
+
+    matches = sorted(c for c in folder.glob("*.csv") if csv_looks_like_nl2_spline(c))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(
+            f"NOTE: {len(matches)} spline CSVs sit beside {elem_path.name} and "
+            "none matched by name, so none was used. Pass --nl2-csv to choose: "
+            + ", ".join(m.name for m in matches),
+            file=sys.stderr,
+        )
+    return None
 
 
 def v_add(a, b):
@@ -787,6 +1187,56 @@ def compute_curvature(samples: List[Dict], baseline_m, min_baseline_m: float = 0
     return out
 
 
+def resolve_track_fit(drop_setting, gauge_setting, car_mesh_path, forward_axis,
+                      box_length_cm):
+    """Work out the rail height and gauge that put the car on its own track.
+
+    Returns (drop_cm, gauge_cm, explanation). 'auto' measures the car's bogies;
+    anything else is taken literally. Getting these wrong is what leaves the car
+    hovering above the rails, which no numeric check catches because the track
+    and the animation are each individually correct.
+    """
+    drop_auto = str(drop_setting).strip().lower() == "auto"
+    gauge_auto = str(gauge_setting).strip().lower() == "auto"
+
+    drop = None if drop_auto else float(drop_setting)
+    gauge = None if gauge_auto else float(gauge_setting)
+    note = "set explicitly"
+
+    if drop_auto or gauge_auto:
+        measured = None
+        if car_mesh_path and Path(car_mesh_path).is_file():
+            try:
+                from read_glb import (
+                    detect_bogie_rails,
+                    orient_forward,
+                    read_glb_triangles,
+                )
+
+                mesh = read_glb_triangles(car_mesh_path)
+                orient_forward(mesh, forward_axis)
+                measured = detect_bogie_rails(mesh)
+            except Exception as ex:
+                note = f"could not measure the car ({ex})"
+
+        if measured:
+            if drop_auto:
+                drop = -float(measured["slot_z_cm"])
+            if gauge_auto:
+                gauge = float(measured["gauge_cm"])
+            note = "measured from the car's bogies"
+        else:
+            # No car to measure: centre the rails under the placeholder box.
+            if drop_auto:
+                drop = box_length_cm * 0.27 * 0.5
+            if gauge_auto:
+                gauge = 100.0
+            if note == "set explicitly":
+                note = "no car mesh to measure; using defaults"
+
+    return drop, gauge, note
+
+
 def simulate_gravity_timeline(
     samples: List[Dict],
     g: float,
@@ -795,7 +1245,22 @@ def simulate_gravity_timeline(
     rolling_friction: float,
     drag_coeff: float,
     curvature: List[float] | None = None,
+    lift_speed: float = 0.0,
 ) -> List[Dict]:
+    """Integrate speed along the track from energy alone, plus a driven lift.
+
+    Gravity, rolling resistance and drag give the free-rolling speed. That is
+    the whole story on a coaster except in one place: a lift hill, where a chain
+    or LSM drives the train at a constant speed regardless of grade. Without
+    that, a gravity-only train runs out of energy on the climb and has to be
+    caught by the min_speed floor, which makes it crawl - the single largest
+    error in the ride's timing.
+
+    So: while the track is climbing and free-rolling would be slower than the
+    lift, the train is on the lift and holds lift_speed exactly. Everywhere else
+    it rolls. min_speed stays only as a numerical floor for the flat, undriven
+    stretches.
+    """
     if not samples:
         return []
 
@@ -816,6 +1281,7 @@ def simulate_gravity_timeline(
             "curvature_1pm": curvature[0],
             "normal_acc_mps2": v_prev * v_prev * curvature[0],
             "tangential_acc_mps2": 0.0,
+            "lift_driven": False,
         }
     )
     timeline.append(first)
@@ -832,11 +1298,22 @@ def simulate_gravity_timeline(
         dh = p0[1] - p1[1]
 
         # Energy update with simple rolling+drag losses.
-        v_sq = max(
-            v_prev * v_prev + 2.0 * g * dh - 2.0 * rolling_friction * g * ds - drag_coeff * ds * v_prev * v_prev,
-            min_speed * min_speed,
+        v_sq = (
+            v_prev * v_prev
+            + 2.0 * g * dh
+            - 2.0 * rolling_friction * g * ds
+            - drag_coeff * ds * v_prev * v_prev
         )
-        v_cur = math.sqrt(v_sq)
+        v_free = math.sqrt(v_sq) if v_sq > 0.0 else 0.0
+
+        # dh is the drop over this step, so dh < 0 means the track is climbing.
+        climbing = dh < 0.0
+        on_lift = lift_speed > 0.0 and climbing and v_free < lift_speed
+        if on_lift:
+            v_cur = lift_speed
+        else:
+            v_cur = max(v_free, min_speed)
+
         v_avg = max(0.5 * (v_prev + v_cur), min_speed)
         dt = ds / v_avg
         t_acc += dt
@@ -852,6 +1329,7 @@ def simulate_gravity_timeline(
                 "normal_acc_mps2": v_cur * v_cur * k,
                 # Longitudinal acceleration: what a rider feels as launch/brake.
                 "tangential_acc_mps2": (v_cur * v_cur - v_prev * v_prev) / (2.0 * ds),
+                "lift_driven": on_lift,
             }
         )
         timeline.append(row)
@@ -927,13 +1405,66 @@ def _resample_by_arclength(pts: List[Tuple[float, float, float]], n_out: int):
 
 
 def load_ue_reference_csv(path: Path) -> List[Tuple[float, float, float]]:
-    """Load a UE-space spline CSV (Index,PosX,PosY,PosZ,...) in centimetres."""
-    with path.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    missing = {"PosX", "PosY", "PosZ"} - set(rows[0].keys() if rows else ())
+    """Load an Unreal-space spline CSV (Index,PosX,PosY,PosZ,...) in centimetres.
+
+    This is a validation reference: an independent, already-converted export of
+    the same ride. It is not the same thing as a source export, and the checks
+    below exist because confusing the two is easy and the failure would
+    otherwise look like a mapping problem.
+    """
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError(f"{path} has no data rows")
+
+    # Exports in the wild use tabs, semicolons or commas.
+    header_line = lines[0]
+    delimiter = max(("\t", ";", ","), key=header_line.count)
+    header = [c.strip().strip('"').strip() for c in header_line.split(delimiter)]
+
+    if "FrontX" in header or "UpX" in header:
+        raise ValueError(
+            f"{path.name} is a NoLimits 2 source export, not an Unreal-space "
+            "reference. It is the converter's input, in metres, so comparing "
+            "the conversion against it proves nothing. Leave the reference "
+            "blank, or point it at a spline exported from Unreal in "
+            "centimetres."
+        )
+
+    missing = {"PosX", "PosY", "PosZ"} - set(header)
     if missing:
-        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
-    return [(float(r["PosX"]), float(r["PosY"]), float(r["PosZ"])) for r in rows]
+        raise ValueError(
+            f"{path.name} is missing required column(s) {sorted(missing)}. "
+            f"Expected an Unreal spline export; header reads {header[:8]}"
+        )
+
+    index_of = {name: header.index(name) for name in ("PosX", "PosY", "PosZ")}
+    points: List[Tuple[float, float, float]] = []
+    for line in lines[1:]:
+        cells = [c.strip().strip('"') for c in line.split(delimiter)]
+        if len(cells) < len(header):
+            continue
+        try:
+            points.append(
+                tuple(float(cells[index_of[n]]) for n in ("PosX", "PosY", "PosZ"))
+            )
+        except ValueError:
+            continue
+
+    if len(points) < 2:
+        raise ValueError(f"{path.name} yielded only {len(points)} usable rows")
+
+    extent = max(
+        max(p[k] for p in points) - min(p[k] for p in points) for k in range(3)
+    )
+    if extent < 500.0:
+        raise ValueError(
+            f"{path.name} spans only {extent:.1f} units, which looks like "
+            "metres. A reference has to be in Unreal centimetres, or the scale "
+            "comparison is meaningless."
+        )
+
+    return points
 
 
 def validate_axis_mapping(
@@ -981,16 +1512,28 @@ def validate_axis_mapping(
 
     results.sort(key=lambda r: r["rms_cm"])
     best = results[0]
+
+    # A reference from a different ride makes every mapping fit badly, which
+    # would otherwise read as "your axis mapping is wrong". Distinguish the two:
+    # if even the best mapping cannot match the reference's overall size, the
+    # reference is not this track and the mapping verdict means nothing.
+    reference_extent = max(ref_span)
+    tolerance = max(reference_extent * 0.15, 100.0)
+    same_track_likely = best["span_error_cm"] <= tolerance
+
     return {
         "reference_length_m": ref_len / M_TO_CM,
+        "reference_span_cm": ref_span,
         "selected_mapping": selected_mapping,
         "best_mapping": best["mapping"],
         "selected_is_best": best["mapping"] == selected_mapping,
+        "same_track_likely": same_track_likely,
+        "span_tolerance_cm": tolerance,
         "scores": results,
     }
 
 
-def report_axis_validation(report: Dict) -> None:
+def report_axis_validation(report: Dict, reference_name: str = "reference") -> None:
     print("")
     print("--- axis mapping / scale validation ---")
     print(f"reference polyline length: {report['reference_length_m']:.2f} m")
@@ -1001,6 +1544,19 @@ def report_axis_validation(report: Dict) -> None:
             f"{r['span_error_cm']:9.2f} cm {r['rms_cm']:9.2f} cm "
             f"{r['length_ratio']:10.5f}"
         )
+
+    if not report.get("same_track_likely", True):
+        best = report["scores"][0]
+        print(
+            f"SKIPPED: '{reference_name}' does not look like this track. Even the "
+            f"closest mapping is off by {best['span_error_cm'] / 100.0:.1f} m on "
+            f"one axis, against a tolerance of "
+            f"{report['span_tolerance_cm'] / 100.0:.1f} m, so this reference "
+            "cannot say anything about the axis mapping. Point "
+            "--validate-reference-csv at an export of THIS ride, or leave it "
+            "blank."
+        )
+        return
 
     if report["selected_is_best"]:
         print(f"OK: selected mapping '{report['selected_mapping']}' is the best fit.")
@@ -1067,7 +1623,30 @@ def stage_car_mesh(mesh_file: Path | None, output_dir: Path) -> Dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert OpenFVD .nlelem data into UE5-ready motion bundle")
-    parser.add_argument("--spline", required=True, type=Path, help="Path to spline .nlelem")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--spline",
+        type=Path,
+        help="OpenFVD binary .nlelem. Needs --tangent for banking.",
+    )
+    source.add_argument(
+        "--nl2elem",
+        type=Path,
+        help="NoLimits 2 XML .nl2elem. Self-contained: path and banking in one "
+             "file, so no --tangent is used or needed.",
+    )
+    parser.add_argument(
+        "--ignore-sibling-csv",
+        action="store_true",
+        help="With --nl2elem, do not look for the spline CSV beside it. Forces "
+             "the unreliable element reconstruction; for diagnosis only.",
+    )
+    source.add_argument(
+        "--nl2-csv",
+        type=Path,
+        help="NoLimits 2 spline CSV export. The most reliable input: already "
+             "resolved to stations with full orientation frames.",
+    )
     parser.add_argument("--tangent", type=Path, help="Path to tangent .nlelem (optional metadata/validation)")
     parser.add_argument("--mesh", type=Path, help="Path to coaster mesh .3ds (optional metadata)")
     parser.add_argument("--output", required=True, type=Path, help="Output bundle JSON path")
@@ -1139,11 +1718,11 @@ def main() -> None:
     )
     car.add_argument(
         "--car-forward-axis",
-        choices=["+X", "-X", "+Y", "-Y"],
-        default="+X",
-        help="Which axis the car mesh faces in its own space. The path frame "
-             "puts travel along +X, so anything else needs a yaw correction or "
-             "the car drives sideways.",
+        choices=["auto", "+X", "-X", "+Y", "-Y"],
+        default="auto",
+        help="Which axis the car mesh faces in its own space. 'auto' measures "
+             "the mesh and picks its longer horizontal axis, which is right for "
+             "any car longer than it is wide.",
     )
     car.add_argument(
         "--car-rotation-offset-deg",
@@ -1170,6 +1749,26 @@ def main() -> None:
         help="Frame rate of the exported CoasterCarAnimated.fbx.",
     )
     car.add_argument(
+        "--car-fbx-import-fps",
+        type=int,
+        default=30,
+        help=(
+            "The animation frame rate of the Unreal project you will import "
+            "into (Project Settings > Animation > Default Frame Rate, 30 by "
+            "default). The take is trimmed to end on a whole frame at this "
+            "rate, because Unreal rejects an animation that is not "
+            "frame-border aligned."
+        ),
+    )
+    car.add_argument(
+        "--no-car-glb",
+        action="store_true",
+        help=(
+            "Skip CoasterCarAnimated.glb. That is the file Unreal imports as an "
+            "AnimSequence on its own, so only skip it if you do not need one."
+        ),
+    )
+    car.add_argument(
         "--no-car-fbx",
         action="store_true",
         help="Skip writing CoasterCarAnimated.fbx.",
@@ -1181,6 +1780,43 @@ def main() -> None:
         help="Real-world car length for a scale check on import. 0 skips it.",
     )
 
+    # Procedural track geometry. Like the car, this is presentation: it changes
+    # nothing in the timeline.
+    track = parser.add_argument_group("track mesh (procedural, presentation only)")
+    track.add_argument(
+        "--no-track-fbx",
+        action="store_true",
+        help="Skip writing CoasterTrack.fbx.",
+    )
+    track.add_argument("--track-station-spacing-cm", type=float, default=40.0)
+    track.add_argument(
+        "--track-gauge-cm",
+        default="auto",
+        help=(
+            "Distance between the rails, in cm. 'auto' measures it off the car's "
+            "bogies so the wheels land on the rails."
+        ),
+    )
+    track.add_argument(
+        "--track-rail-drop-cm",
+        default="auto",
+        help=(
+            "How far the rails sit below the animation path, in cm. 'auto' "
+            "measures it off the car: a bogie grips the rail from above and "
+            "below, and the gap between those wheels is where the rail belongs. "
+            "Getting this wrong is what leaves the car floating above its own "
+            "track. Falls back to half the placeholder box when no car mesh is "
+            "given."
+        ),
+    )
+    track.add_argument("--track-tie-spacing-cm", type=float, default=150.0)
+    track.add_argument(
+        "--no-track-supports",
+        action="store_true",
+        help="Skip the support columns.",
+    )
+    track.add_argument("--track-support-spacing-cm", type=float, default=900.0)
+
     parser.add_argument(
         "--validate-reference-csv",
         type=Path,
@@ -1191,10 +1827,38 @@ def main() -> None:
         ),
     )
     parser.add_argument("--g", type=float, default=9.81)
-    parser.add_argument("--initial-speed", type=float, default=6.0)
-    parser.add_argument("--min-speed", type=float, default=1.0)
-    parser.add_argument("--rolling-friction", type=float, default=0.004)
-    parser.add_argument("--drag-coeff", type=float, default=0.0004)
+    parser.add_argument(
+        "--initial-speed", type=float, default=6.0,
+        help="Speed in m/s as the train leaves the station.",
+    )
+    parser.add_argument(
+        "--min-speed", type=float, default=1.0,
+        help=(
+            "Slowest the train is ever allowed to go, in m/s. This is what "
+            "carries it up the lift hill: the model is gravity-only, so on a "
+            "sustained climb the train runs out of energy and rides this floor. "
+            "Set it to your lift chain or LSM speed (often 3-5 m/s), or the "
+            "climb crawls and the whole ride reads slower than NoLimits does."
+        ),
+    )
+    parser.add_argument(
+        "--lift-speed", type=float, default=4.0,
+        help=(
+            "Chain or LSM lift speed in m/s. Wherever the track climbs and the "
+            "train could not hold this speed on gravity alone, it is treated as "
+            "being on the lift and driven at exactly this speed - which is what "
+            "a real lift does. Set to 0 to model the ride as purely "
+            "gravity-driven, which will make every climb crawl."
+        ),
+    )
+    parser.add_argument(
+        "--rolling-friction", type=float, default=0.004,
+        help="Rolling resistance coefficient.",
+    )
+    parser.add_argument(
+        "--drag-coeff", type=float, default=0.0004,
+        help="Air drag coefficient, per metre of speed squared.",
+    )
     parser.add_argument("--disable-spike-filter", action="store_true")
     parser.add_argument("--spike-angle-threshold-deg", type=float, default=70.0)
     parser.add_argument("--spike-deviation-multiplier", type=float, default=0.25)
@@ -1214,20 +1878,97 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    spline = parse_nlelem(args.spline)
-    tangent = parse_nlelem(args.tangent) if args.tangent else None
+    spline = None
+    tangent = None
+    nl2_frames = None
+    source_kind = "nlelem"
+    source_note = ""
 
-    if tangent and tangent.node_count != spline.node_count:
-        raise ValueError(
-            f"Node mismatch: spline has {spline.node_count}, tangent has {tangent.node_count}."
+    if args.nl2_csv:
+        source_kind = "nl2_csv"
+        sampled, source_note = parse_nl2_spline_csv(args.nl2_csv, args.axis_mapping)
+        print(f"Read {args.nl2_csv.name}: {source_note}")
+        if args.tangent:
+            print(
+                "NOTE: --tangent is ignored for a spline CSV; the file already "
+                "carries orientation."
+            )
+
+    elif args.nl2elem:
+        description = ""
+        try:
+            _, _, description = parse_nl2elem(args.nl2elem)
+        except Exception:
+            # Only needed to locate the CSV; a parse failure is reported below.
+            pass
+
+        sibling = (
+            None
+            if args.ignore_sibling_csv
+            else find_sibling_spline_csv(args.nl2elem, description)
         )
 
-    sampled = build_sampled_path(
-        elem=spline,
-        samples_per_segment=max(args.samples_per_segment, 2),
-        axis_mapping=args.axis_mapping,
-        initial_roll=spline.nodes[0].roll if spline.nodes else 0.0,
-    )
+        if sibling is not None:
+            source_kind = "nl2_csv"
+            sampled, source_note = parse_nl2_spline_csv(sibling, args.axis_mapping)
+            print(
+                f"Read {args.nl2elem.name} -> using its spline export "
+                f"{sibling.name}: {source_note}"
+            )
+            print(
+                "  The CSV is fully resolved, so nothing about the track has to "
+                "be reconstructed. Pass --ignore-sibling-csv to force the "
+                "element reader instead."
+            )
+        else:
+            source_kind = "nl2elem"
+            spline, nl2_frames, description = parse_nl2elem(args.nl2elem)
+            source_note = description
+            print(
+                f"Read {args.nl2elem.name}: {spline.node_count} vertex triples, "
+                f"{len(nl2_frames)} banking frames"
+                + (f", description {description!r}" if description else "")
+            )
+            print(
+                "WARNING: no spline CSV was found next to this element, so its "
+                "geometry is being reconstructed. That reconstruction is NOT "
+                "reliable: NoLimits 2's spline basis for .nl2elem could not be "
+                "determined, and no reading of the vertices tested gives a "
+                "C1-continuous path. Expect corners the real ride does not "
+                "have. Export the spline CSV from NoLimits 2 (File > Export) "
+                "and pass it instead.",
+                file=sys.stderr,
+            )
+            sampled = build_sampled_path(
+                elem=spline,
+                samples_per_segment=max(args.samples_per_segment, 2),
+                axis_mapping=args.axis_mapping,
+                initial_roll=0.0,
+            )
+            apply_nl2_roll_frames(sampled, nl2_frames, args.axis_mapping)
+
+        if args.tangent:
+            print(
+                "NOTE: --tangent is ignored for NoLimits 2 input; banking comes "
+                "from the file itself."
+            )
+
+    else:
+        spline = parse_nlelem(args.spline)
+        tangent = parse_nlelem(args.tangent) if args.tangent else None
+
+        if tangent and tangent.node_count != spline.node_count:
+            raise ValueError(
+                f"Node mismatch: spline has {spline.node_count}, "
+                f"tangent has {tangent.node_count}."
+            )
+
+        sampled = build_sampled_path(
+            elem=spline,
+            samples_per_segment=max(args.samples_per_segment, 2),
+            axis_mapping=args.axis_mapping,
+            initial_roll=spline.nodes[0].roll if spline.nodes else 0.0,
+        )
 
     # The spike filter rewrites sample positions. Every position edit changes
     # local curvature, and curvature is what the forces are derived from: a
@@ -1257,17 +1998,40 @@ def main() -> None:
 
     validation = None
     if args.validate_reference_csv:
-        node_points_m = [(0.0, 0.0, 0.0)] + [n.p1 for n in spline.nodes]
-        validation = validate_axis_mapping(
-            source_points_m=node_points_m,
-            reference_cm=load_ue_reference_csv(args.validate_reference_csv),
-            selected_mapping=args.axis_mapping,
-        )
-        report_axis_validation(validation)
+        if spline is not None:
+            # Node endpoints are the cheapest faithful summary of the path.
+            source_points_m = [(0.0, 0.0, 0.0)] + [n.p1 for n in spline.nodes]
+        else:
+            # A resolved export has no control points, so the stations are the
+            # path. Decimated because the comparison resamples anyway.
+            step = max(1, len(sampled) // 2000)
+            source_points_m = [tuple(s["pos_m"]) for s in sampled[::step]]
 
-    gaps = detect_source_gaps(spline)
-    breaks = detect_tangent_breaks(spline, args.tangent_break_threshold_deg)
-    malformed = detect_malformed_segments(spline, args.segment_distortion_ratio)
+        # Validation is advisory. An unusable reference must not cost the export.
+        try:
+            validation = validate_axis_mapping(
+                source_points_m=source_points_m,
+                reference_cm=load_ue_reference_csv(args.validate_reference_csv),
+                selected_mapping=args.axis_mapping,
+            )
+            report_axis_validation(validation, Path(args.validate_reference_csv).name)
+        except Exception as ex:
+            validation = None
+            print(
+                f"NOTE: skipping axis validation. {ex}",
+                file=sys.stderr,
+            )
+
+    if spline is not None:
+        gaps = detect_source_gaps(spline)
+        breaks = detect_tangent_breaks(spline, args.tangent_break_threshold_deg)
+        malformed = detect_malformed_segments(spline, args.segment_distortion_ratio)
+    else:
+        # A resolved export has no control points to inspect, so spacing is the
+        # only defect signal available.
+        gaps = detect_sample_gaps(sampled)
+        breaks = []
+        malformed = []
     real_gaps = [g for g in gaps if g["kind"] == "missing_track"]
     if gaps:
         print("")
@@ -1344,6 +2108,7 @@ def main() -> None:
             min_speed=args.min_speed,
             rolling_friction=args.rolling_friction,
             drag_coeff=args.drag_coeff,
+            lift_speed=args.lift_speed,
             curvature=curv,
         )
 
@@ -1383,7 +2148,12 @@ def main() -> None:
     bundle = {
         "format": "ue5_coaster_bundle_v2",
         "source": {
-            "spline_nlelem": str(args.spline),
+            "kind": source_kind,
+            "file": str(
+                args.nl2_csv or args.nl2elem or args.spline
+            ),
+            "note": source_note,
+            "spline_nlelem": str(args.spline) if args.spline else None,
             "tangent_nlelem": str(args.tangent) if args.tangent else None,
             "mesh_3ds": str(args.mesh) if args.mesh else None,
             "axis_mapping": args.axis_mapping,
@@ -1429,7 +2199,9 @@ def main() -> None:
             "preserves_handedness": mapping_determinant(args.axis_mapping) < 0.0,
         },
         "nlelem": {
-            "spline": {
+            "spline": None
+            if spline is None
+            else {
                 "data_length": spline.data_length,
                 "node_count": spline.node_count,
             },
@@ -1447,6 +2219,7 @@ def main() -> None:
             "g": args.g,
             "initial_speed": args.initial_speed,
             "min_speed": args.min_speed,
+            "lift_speed": args.lift_speed,
             "rolling_friction": args.rolling_friction,
             "drag_coeff": args.drag_coeff,
         },
@@ -1484,45 +2257,201 @@ def main() -> None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         write_csv_timeline(args.csv, timeline)
 
+    # A failed sub-export used to leave a stale file on disk while the summary
+    # still read as a success, which is worse than failing outright: the next
+    # import silently uses the old geometry. Collect them and say so loudly.
+    export_failures: List[str] = []
+
+    # Shared by the car and track exports, so it lives outside all of them.
+    nominal_car_length_cm = (
+        args.car_expected_length_m * 100.0
+        if args.car_expected_length_m > 0.0
+        else 450.0
+    )
+    staged_car_path = (
+        args.output.parent / bundle["car"]["mesh_file"]
+        if bundle["car"].get("mesh_file")
+        else None
+    )
+
     if not args.no_car_fbx:
         # The animation has to exist as a real file in the export, not only as
         # something the Unreal script reconstructs from the timeline.
         try:
             from export_car_animation import write_car_animation_fbx
 
-            length_cm = (
-                args.car_expected_length_m * 100.0
-                if args.car_expected_length_m > 0.0
-                else 450.0
-            )
             fbx_info = write_car_animation_fbx(
                 args.output.parent / "CoasterCarAnimated.fbx",
                 timeline,
                 fps=max(int(args.car_fbx_fps), 1),
-                box_size_cm=(length_cm, length_cm * 0.36, length_cm * 0.27),
+                box_size_cm=(nominal_car_length_cm, nominal_car_length_cm * 0.36, nominal_car_length_cm * 0.27),
+                car_mesh_file=str(staged_car_path) if staged_car_path else None,
+                car_forward_axis=args.car_forward_axis,
+                import_fps=max(int(args.car_fbx_import_fps), 1),
             )
             bundle["car"]["animation_fbx"] = Path(fbx_info["path"]).name
             bundle["car"]["animation_fbx_fps"] = fbx_info["fps"]
             args.output.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+            bundle["car"]["animation_geometry"] = fbx_info["geometry"]
+            args.output.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
             print(
                 f"Wrote animation: {Path(fbx_info['path']).name} "
                 f"({fbx_info['frames']} frames at {fbx_info['fps']}fps, "
+                f"{fbx_info['duration_s']:.3f}s aligned to "
+                f"{fbx_info['import_fps']}fps import, "
                 f"{fbx_info['size_bytes'] / 1024:.0f} KB)"
             )
+            print(f"  car geometry: {fbx_info['geometry']}")
         except Exception as ex:
+            export_failures.append(f"CoasterCarAnimated.fbx: {ex}")
             print(
                 f"WARNING: could not write the animated FBX: {ex}",
                 file=sys.stderr,
             )
 
+    if not args.no_car_glb:
+        # The one file Unreal imports as an animation on its own. Its FBX
+        # sibling carries the same motion for other tools, but Unreal's FBX
+        # translator drops the take, so this is what to drag into the content
+        # browser.
+        try:
+            from export_car_glb import write_car_glb
+
+            glb_info = write_car_glb(
+                args.output.parent / "CoasterCarAnimated.glb",
+                timeline,
+                fps=max(int(args.car_fbx_fps), 1),
+                box_size_cm=(nominal_car_length_cm, nominal_car_length_cm * 0.36, nominal_car_length_cm * 0.27),
+                car_mesh_file=str(staged_car_path) if staged_car_path else None,
+                car_forward_axis=args.car_forward_axis,
+                import_fps=max(int(args.car_fbx_import_fps), 1),
+            )
+            bundle["car"]["animation_glb"] = Path(glb_info["path"]).name
+            bundle["car"]["animation_glb_fps"] = glb_info["fps"]
+            args.output.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+            print(
+                f"Wrote animation: {Path(glb_info['path']).name} "
+                f"({glb_info['frames']} frames at {glb_info['fps']}fps, "
+                f"{glb_info['duration_s']:.3f}s, "
+                f"{glb_info['size_bytes'] / 1024:.0f} KB)"
+                "  <- import this one into Unreal"
+            )
+        except Exception as ex:
+            export_failures.append(f"CoasterCarAnimated.glb: {ex}")
+            print(
+                f"WARNING: could not write the animated GLB: {ex}",
+                file=sys.stderr,
+            )
+
+    if not args.no_track_fbx:
+        # Built from render_path: the spike-filtered copy, which is the one
+        # meant for display. The analytic path is never used for geometry.
+        try:
+            from export_track_mesh import write_track_fbx, write_track_glb
+
+            rail_drop_cm, gauge_cm, fit_note = resolve_track_fit(
+                args.track_rail_drop_cm,
+                args.track_gauge_cm,
+                staged_car_path,
+                args.car_forward_axis,
+                nominal_car_length_cm,
+            )
+            print(
+                f"  track fit: rails {rail_drop_cm:+.1f} cm from the path, "
+                f"gauge {gauge_cm:.1f} cm ({fit_note})"
+            )
+
+            track_kwargs = dict(
+                station_spacing_cm=args.track_station_spacing_cm,
+                gauge_cm=gauge_cm,
+                rail_drop_cm=rail_drop_cm,
+                spine_drop_cm=rail_drop_cm + 35.0,
+                tie_spacing_cm=args.track_tie_spacing_cm,
+                supports=not args.no_track_supports,
+                support_spacing_cm=args.track_support_spacing_cm,
+            )
+            # The .glb is the one to import: Unreal mirrors FBX in Y, so an FBX
+            # track lands nowhere near the glTF car.
+            glb_track = write_track_glb(
+                args.output.parent / "CoasterTrack.glb",
+                bundle["render_path"],
+                **track_kwargs,
+            )
+            bundle["track_mesh_glb"] = Path(glb_track["path"]).name
+            print(
+                f"Wrote track: {Path(glb_track['path']).name} "
+                f"({sum(glb_track['parts'].values())} polys, "
+                f"{glb_track['size_bytes'] / 1024 / 1024:.1f} MB)"
+                "  <- import this one into Unreal"
+            )
+
+            track_info = write_track_fbx(
+                args.output.parent / "CoasterTrack.fbx",
+                bundle["render_path"],
+                station_spacing_cm=args.track_station_spacing_cm,
+                gauge_cm=gauge_cm,
+                rail_drop_cm=rail_drop_cm,
+                spine_drop_cm=rail_drop_cm + 35.0,
+                tie_spacing_cm=args.track_tie_spacing_cm,
+                supports=not args.no_track_supports,
+                support_spacing_cm=args.track_support_spacing_cm,
+            )
+            bundle["track_mesh"] = {
+                "file": Path(track_info["path"]).name,
+                "parts": list(track_info["parts"].keys()),
+                "polygons": sum(track_info["parts"].values()),
+                "stations": track_info["stations"],
+                "supports": track_info["supports"],
+                "gauge_cm": gauge_cm,
+                "rail_drop_cm": rail_drop_cm,
+            }
+            args.output.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+            print(
+                f"Wrote track: {Path(track_info['path']).name} "
+                f"({sum(track_info['parts'].values())} polys, "
+                f"{track_info['ties']} ties, {track_info['supports']} supports, "
+                f"{track_info['size_bytes'] / 1024 / 1024:.1f} MB)"
+            )
+        except Exception as ex:
+            export_failures.append(f"CoasterTrack.glb / .fbx: {ex}")
+            print(
+                f"WARNING: could not write the track mesh: {ex}", file=sys.stderr
+            )
+
     print(f"Wrote bundle: {args.output}")
     if args.csv:
         print(f"Wrote csv: {args.csv}")
-    print(f"Nodes: {spline.node_count}, sampled points: {len(timeline)}")
+    if spline is not None:
+        print(f"Nodes: {spline.node_count}, sampled points: {len(timeline)}")
+    else:
+        print(f"Stations: {len(sampled)}, sampled points: {len(timeline)}")
     print(
         f"Axis mapping: {args.axis_mapping} (determinant "
         f"{mapping_determinant(args.axis_mapping):+.0f})"
     )
+
+    if nl2_frames:
+        residual = nl2_frame_residual(sampled, nl2_frames)
+        bundle["source"]["nl2elem_frame_residual_deg"] = residual
+        args.output.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+        if residual:
+            print(
+                f"Banking alignment: median {residual['median_deg']:.1f} deg, "
+                f"p90 {residual['p90_deg']:.1f} deg over "
+                f"{residual['frames']} frames"
+            )
+            if residual["median_deg"] > 5.0:
+                print(
+                    "WARNING: the .nl2elem reader reconstructs NoLimits 2's "
+                    "spline, and this file's banking frames disagree with the "
+                    f"reconstructed path by a median of "
+                    f"{residual['median_deg']:.1f} degrees. Positions and "
+                    "speeds are unaffected, but the banking is out of phase, "
+                    "which shifts the split between vertical and lateral G. "
+                    "Export the spline CSV from NoLimits 2 and pass --nl2-csv "
+                    "for an exact result.",
+                    file=sys.stderr,
+                )
     if args.car_mesh_asset or staged_car["mesh_file"]:
         print(
             f"Car: {args.car_mesh_asset or staged_car['mesh_file']} "
@@ -1554,6 +2483,37 @@ def main() -> None:
         f"{timeline[-1]['distance_m']:.1f}m, speed "
         f"{pct(speeds, 0.5):.1f}/{speeds[-1]:.1f} m/s (median/peak)"
     )
+
+    # Where the lift took over, so the driven sections are inspectable rather
+    # than just quietly changing the ride time.
+    lifts = []
+    run = None
+    for row in timeline:
+        if row.get("lift_driven"):
+            if run is None:
+                run = [row, row]
+            else:
+                run[1] = row
+        elif run is not None:
+            lifts.append(run)
+            run = None
+    if run is not None:
+        lifts.append(run)
+
+    if lifts:
+        total = sum(b["time_s"] - a["time_s"] for a, b in lifts)
+        print(
+            f"Lift: {len(lifts)} driven section(s) at {args.lift_speed:.1f} m/s, "
+            f"{total:.1f}s of the ride ({100.0 * total / timeline[-1]['time_s']:.0f}%)"
+        )
+        for a, b in lifts:
+            climb = a["pos_m"][1] - b["pos_m"][1]
+            print(
+                f"  {a['distance_m']:7.0f}-{b['distance_m']:.0f} m: "
+                f"{b['time_s'] - a['time_s']:5.1f}s, climbing {-climb:+.1f} m"
+            )
+    elif args.lift_speed > 0.0:
+        print("Lift: none detected - the train holds speed on every climb.")
     print(
         f"Normal G, all samples      : median {pct(all_g, 0.5):.2f}  "
         f"p95 {pct(all_g, 0.95):.2f}  peak {all_g[-1]:.2f}"
@@ -1575,6 +2535,22 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    if export_failures:
+        # Loud, on stdout, and a non-zero exit: a half-written export leaves
+        # stale files next to fresh ones, and the stale ones import silently.
+        print("")
+        print(f"EXPORT INCOMPLETE - {len(export_failures)} file(s) were not written:")
+        for failure in export_failures:
+            print(f"  {failure}")
+        print(
+            "  Any older copy of those files is still on disk and will import "
+            "as if it were current. Fix the error above and re-run before "
+            "importing anything."
+        )
+        return 1
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

@@ -29,7 +29,7 @@ APP_STATE_DIR = Path(
 CONVERTER_SCRIPT = RESOURCE_DIR / "convert_nlelem_to_ue.py"
 STATE_FILE = APP_STATE_DIR / ".gui_state.json"
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 7
 
 # LSU brand colours: Purple PMS 268 and Gold PMS 123.
 LSU_PURPLE = "#461D7C"
@@ -89,6 +89,7 @@ class PipelineConfig:
 
     # Physics
     initial_speed: float = 6.0
+    lift_speed: float = 4.0
     rolling_friction: float = 0.004
     drag_coeff: float = 0.0004
     curvature_window_s: float = 0.15
@@ -97,13 +98,24 @@ class PipelineConfig:
     # Coaster car. Presentation only: none of it affects the physics timeline.
     car_mesh_asset: str = ""
     car_mesh_file: str = ""
-    car_forward_axis: str = "+X"
+    car_forward_axis: str = "auto"
     car_scale: float = 1.0
     car_offset_z_cm: float = 0.0
     car_yaw_offset_deg: float = 0.0
     car_expected_length_m: float = 0.0
     car_export_fbx: bool = True
+    car_export_glb: bool = True
     car_fbx_fps: int = 60
+    car_import_fps: int = 30
+
+    # Procedural track mesh. Presentation only, like the car.
+    track_export_fbx: bool = True
+    track_station_spacing_cm: float = 40.0
+    track_gauge_cm: float = 100.0
+    track_rail_drop_cm: float = 110.0
+    track_tie_spacing_cm: float = 150.0
+    track_supports: bool = True
+    track_support_spacing_cm: float = 900.0
 
     # Geometry / sampling
     axis_mapping: str = "nl2_to_ue_swap_yz"
@@ -232,12 +244,34 @@ def migrate_state(cfg: PipelineConfig, data: dict) -> PipelineConfig:
             cfg.car_mesh_file = legacy_car
             notes.append(f"car_mesh_file adopted from cart_model_glb: {legacy_car}")
 
+    if from_version < 5:
+        # "+X" was the old default rather than a considered choice, and it mounts
+        # a car sideways whenever the model is longer on Y - which is common.
+        # "auto" measures the mesh instead, and still resolves to +X for a car
+        # that really is longest on X.
+        if cfg.car_forward_axis == "+X":
+            notes.append(
+                "car_forward_axis: '+X' -> 'auto' (measures the mesh; the old "
+                "default mounted a Y-long car across the track)"
+            )
+            cfg.car_forward_axis = "auto"
+
     if from_version < 4:
         dropped = sorted(REMOVED_KEYS & set(data))
         if dropped:
             notes.append(
                 f"dropped {len(dropped)} obsolete setting(s): {', '.join(dropped)}"
             )
+
+    if from_version < 7 and "lift_speed" not in data:
+        # New in 7: climbs used to be caught by the min_speed floor, which made
+        # the lift crawl and every ride read slow.
+        notes.append(f"lift_speed: {cfg.lift_speed} m/s (lift hills are now driven, not coasted)")
+
+    if from_version < 6 and "car_export_glb" not in data:
+        # New in 6: the .glb is the only file Unreal imports as an AnimSequence,
+        # so it is on by default even for configs saved before it existed.
+        notes.append("car_export_glb: on (the .glb is what Unreal imports as animation)")
 
     if from_version < CONFIG_VERSION:
         cfg.config_version = CONFIG_VERSION
@@ -253,17 +287,37 @@ def save_state(cfg: PipelineConfig) -> None:
     STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+# Which converter flag each track-file extension maps to. NoLimits 2 formats
+# carry their own banking, so neither needs a tangent file.
+SOURCE_FLAGS = {
+    ".nlelem": "--spline",
+    ".nl2elem": "--nl2elem",
+    ".csv": "--nl2-csv",
+}
+
+
+def source_flag_for(path: str) -> str:
+    """The converter argument that suits this track file."""
+    return SOURCE_FLAGS.get(Path(path).suffix.lower(), "--spline")
+
+
+def needs_tangent(path: str) -> bool:
+    """Only OpenFVD's binary format takes a separate tangent file."""
+    return source_flag_for(path) == "--spline"
+
+
 def build_converter_command(
     cfg: PipelineConfig, bundle_path: Path, csv_path: Path, python_exe: Path
 ) -> list[str]:
     args = [
-        "--spline", str(cfg.spline_nlelem),
+        source_flag_for(cfg.spline_nlelem), str(cfg.spline_nlelem),
         "--output", str(bundle_path),
         "--csv", str(csv_path),
         "--samples-per-segment", str(cfg.samples_per_segment),
         "--resample-spacing-m", str(cfg.resample_spacing_m),
         "--axis-mapping", cfg.axis_mapping,
         "--initial-speed", str(cfg.initial_speed),
+        "--lift-speed", str(cfg.lift_speed),
         "--rolling-friction", str(cfg.rolling_friction),
         "--drag-coeff", str(cfg.drag_coeff),
         "--curvature-window-s", str(cfg.curvature_window_s),
@@ -274,8 +328,22 @@ def build_converter_command(
 
     if not cfg.car_export_fbx:
         args.append("--no-car-fbx")
+    if not cfg.car_export_glb:
+        args.append("--no-car-glb")
+    if not cfg.track_export_fbx:
+        args.append("--no-track-fbx")
+    if not cfg.track_supports:
+        args.append("--no-track-supports")
+    args.extend([
+        "--track-station-spacing-cm", str(cfg.track_station_spacing_cm),
+        "--track-gauge-cm", str(cfg.track_gauge_cm),
+        "--track-rail-drop-cm", str(cfg.track_rail_drop_cm),
+        "--track-tie-spacing-cm", str(cfg.track_tie_spacing_cm),
+        "--track-support-spacing-cm", str(cfg.track_support_spacing_cm),
+    ])
     args.extend([
         "--car-fbx-fps", str(cfg.car_fbx_fps),
+        "--car-fbx-import-fps", str(cfg.car_import_fps),
         "--car-forward-axis", cfg.car_forward_axis,
         "--car-scale", str(cfg.car_scale),
         "--car-expected-length-m", str(cfg.car_expected_length_m),
@@ -288,7 +356,7 @@ def build_converter_command(
         args.extend(["--car-mesh-file", cfg.car_mesh_file.strip()])
 
     tangent = cfg.tangent_nlelem.strip()
-    if tangent:
+    if tangent and needs_tangent(cfg.spline_nlelem):
         args.extend(["--tangent", tangent])
 
     reference = cfg.validate_reference_csv.strip()
@@ -323,9 +391,20 @@ def run_pipeline(cfg: PipelineConfig, log) -> int:
     if not cfg.output_dir.strip():
         raise ValueError("Select an output folder first.")
 
+    flag = source_flag_for(cfg.spline_nlelem)
+    label = {
+        "--spline": "OpenFVD element (.nlelem)",
+        "--nl2elem": "NoLimits 2 element (.nl2elem)",
+        "--nl2-csv": "NoLimits 2 spline export (.csv)",
+    }[flag]
+    log(f"Input format: {label}")
+
     tangent = cfg.tangent_nlelem.strip()
-    if tangent and not Path(tangent).exists():
-        raise FileNotFoundError(f"Tangent file not found: {tangent}")
+    if needs_tangent(cfg.spline_nlelem):
+        if tangent and not Path(tangent).exists():
+            raise FileNotFoundError(f"Tangent file not found: {tangent}")
+    elif tangent:
+        log("Tangent file ignored: this format carries its own banking.")
 
     if not IS_FROZEN:
         # Guard against a stale setting pointing at the packaged GUI itself,
@@ -666,6 +745,7 @@ def launch_gui() -> None:
         "validate_reference_csv": tk.StringVar(value=cfg.validate_reference_csv),
         "python_exe": tk.StringVar(value=cfg.python_exe),
         "initial_speed": tk.DoubleVar(value=cfg.initial_speed),
+        "lift_speed": tk.DoubleVar(value=cfg.lift_speed),
         "rolling_friction": tk.DoubleVar(value=cfg.rolling_friction),
         "drag_coeff": tk.DoubleVar(value=cfg.drag_coeff),
         "curvature_window_s": tk.DoubleVar(value=cfg.curvature_window_s),
@@ -678,7 +758,16 @@ def launch_gui() -> None:
         "car_yaw_offset_deg": tk.DoubleVar(value=cfg.car_yaw_offset_deg),
         "car_expected_length_m": tk.DoubleVar(value=cfg.car_expected_length_m),
         "car_export_fbx": tk.BooleanVar(value=cfg.car_export_fbx),
+        "car_export_glb": tk.BooleanVar(value=cfg.car_export_glb),
         "car_fbx_fps": tk.IntVar(value=cfg.car_fbx_fps),
+        "car_import_fps": tk.IntVar(value=cfg.car_import_fps),
+        "track_export_fbx": tk.BooleanVar(value=cfg.track_export_fbx),
+        "track_station_spacing_cm": tk.DoubleVar(value=cfg.track_station_spacing_cm),
+        "track_gauge_cm": tk.DoubleVar(value=cfg.track_gauge_cm),
+        "track_rail_drop_cm": tk.DoubleVar(value=cfg.track_rail_drop_cm),
+        "track_tie_spacing_cm": tk.DoubleVar(value=cfg.track_tie_spacing_cm),
+        "track_supports": tk.BooleanVar(value=cfg.track_supports),
+        "track_support_spacing_cm": tk.DoubleVar(value=cfg.track_support_spacing_cm),
         "axis_mapping": tk.StringVar(value=cfg.axis_mapping),
         "samples_per_segment": tk.IntVar(value=cfg.samples_per_segment),
         "resample_spacing_m": tk.DoubleVar(value=cfg.resample_spacing_m),
@@ -855,13 +944,22 @@ def launch_gui() -> None:
     # ---------------- Files ----------------
     files = make_tab("Files")
     add_path_row(
-        files, 0, "Spline .nlelem", "spline_nlelem",
-        "The track file exported from OpenFVD or NoLimits 2. Required.",
-        "file", [("NLElem", "*.nlelem"), ("All", "*.*")],
+        files, 0, "Track file", "spline_nlelem",
+        "The track from OpenFVD (.nlelem) or NoLimits 2 (.nl2elem or a spline "
+        ".csv). Required.",
+        "file",
+        [
+            ("Track files", "*.nlelem *.nl2elem *.csv"),
+            ("OpenFVD element", "*.nlelem"),
+            ("NoLimits 2 element", "*.nl2elem"),
+            ("NoLimits 2 spline CSV", "*.csv"),
+            ("All", "*.*"),
+        ],
     )
     add_path_row(
-        files, 1, "Tangent .nlelem", "tangent_nlelem",
-        "The matching tangent file from the same export. Optional.",
+        files, 1, "Tangent file", "tangent_nlelem",
+        "Only used with an OpenFVD .nlelem. NoLimits 2 files carry their own "
+        "banking. Optional.",
         "file", [("NLElem", "*.nlelem"), ("All", "*.*")],
     )
     add_path_row(
@@ -870,8 +968,9 @@ def launch_gui() -> None:
     )
     add_path_row(
         files, 3, "Reference CSV", "validate_reference_csv",
-        "A spline CSV already known to be correct, used to check this one "
-        "against. Optional.",
+        "Optional check. A spline exported from Unreal, in centimetres, of this "
+        "same ride. Not the NoLimits CSV above - that is the input. Leave blank "
+        "if unsure.",
         "file", [("CSV", "*.csv"), ("All", "*.*")],
     )
 
@@ -890,9 +989,9 @@ def launch_gui() -> None:
     )
     add_value_row(
         car, 1, 1, "Faces along", "car_forward_axis",
-        "The direction the car model points. Change it if the car drives "
+        "Which way the car model faces. Leave on auto unless the car drives "
         "sideways.",
-        "combo", values=["+X", "-X", "+Y", "-Y"],
+        "combo", values=["auto", "+X", "-X", "+Y", "-Y"],
     )
     add_value_row(
         car, 2, 0, "Extra yaw (deg)", "car_yaw_offset_deg",
@@ -914,11 +1013,53 @@ def launch_gui() -> None:
         car, 4, "BAKED ANIMATION",
         "Saves the car's movement along the track as an animation file.",
     )
-    add_toggle(car, 5, "Export CoasterCarAnimated.fbx", "car_export_fbx")
+    add_toggle(
+        car, 5, "Export CoasterCarAnimated.glb  (import this one into Unreal)",
+        "car_export_glb",
+    )
+    add_toggle(car, 6, "Export CoasterCarAnimated.fbx  (for other tools)", "car_export_fbx")
     add_value_row(
-        car, 6, 0, "Animation FPS", "car_fbx_fps",
+        car, 7, 0, "Animation FPS", "car_fbx_fps",
         "Frames per second for the animation file.",
         "spin", from_=15, to=240, increment=15,
+    )
+    add_value_row(
+        car, 8, 0, "Unreal animation FPS", "car_import_fps",
+        "Your Unreal project's Default Frame Rate, under Project Settings > "
+        "Animation. The animation is cut to end on a whole frame at this rate, "
+        "because Unreal rejects one that is not frame-aligned.",
+        "spin", from_=15, to=240, increment=15,
+    )
+
+    # ---------------- Track ----------------
+    track = make_tab("Track")
+    add_section(
+        track, 0, "PROCEDURAL TRACK",
+        "Builds rails, a spine, crossties and support columns along the ride "
+        "and saves them as CoasterTrack.fbx. Generated geometry, not the "
+        "original model.",
+    )
+    add_toggle(track, 1, "Export CoasterTrack.fbx", "track_export_fbx")
+    add_value_row(
+        track, 2, 0, "Rail gauge (cm)", "track_gauge_cm",
+        "Distance between the two rails.",
+    )
+    add_value_row(
+        track, 2, 1, "Rail drop (cm)", "track_rail_drop_cm",
+        "How far the rails sit below the ride path.",
+    )
+    add_value_row(
+        track, 3, 0, "Detail spacing (cm)", "track_station_spacing_cm",
+        "Distance between cross-sections. Smaller is smoother and heavier.",
+    )
+    add_value_row(
+        track, 3, 1, "Tie spacing (cm)", "track_tie_spacing_cm",
+        "Distance between crossties.",
+    )
+    add_toggle(track, 4, "Include support columns", "track_supports")
+    add_value_row(
+        track, 5, 0, "Support spacing (cm)", "track_support_spacing_cm",
+        "Distance between support columns.",
     )
 
     # ---------------- Physics ----------------
@@ -942,6 +1083,12 @@ def launch_gui() -> None:
     add_value_row(
         physics, 2, 0, "Curvature floor (m)", "curvature_baseline_m",
         "Shortest distance used to measure how sharply the track bends.",
+    )
+    add_value_row(
+        physics, 2, 1, "Lift speed (m/s)", "lift_speed",
+        "How fast the chain or launch drives the car up a hill. Gravity alone "
+        "cannot get a car up a lift, so without this the climb crawls and the "
+        "whole ride comes out slower than it should. Set 0 for gravity only.",
     )
 
     # ---------------- Geometry ----------------
@@ -1110,6 +1257,7 @@ def launch_gui() -> None:
             validate_reference_csv=vars_dict["validate_reference_csv"].get().strip(),
             python_exe=vars_dict["python_exe"].get().strip() or sys.executable,
             initial_speed=num("initial_speed", float),
+            lift_speed=num("lift_speed", float),
             rolling_friction=num("rolling_friction", float),
             drag_coeff=num("drag_coeff", float),
             curvature_window_s=num("curvature_window_s", float),
@@ -1122,7 +1270,16 @@ def launch_gui() -> None:
             car_yaw_offset_deg=num("car_yaw_offset_deg", float),
             car_expected_length_m=num("car_expected_length_m", float),
             car_export_fbx=bool(vars_dict["car_export_fbx"].get()),
+            car_export_glb=bool(vars_dict["car_export_glb"].get()),
             car_fbx_fps=num("car_fbx_fps", int),
+            car_import_fps=num("car_import_fps", int),
+            track_export_fbx=bool(vars_dict["track_export_fbx"].get()),
+            track_station_spacing_cm=num("track_station_spacing_cm", float),
+            track_gauge_cm=num("track_gauge_cm", float),
+            track_rail_drop_cm=num("track_rail_drop_cm", float),
+            track_tie_spacing_cm=num("track_tie_spacing_cm", float),
+            track_supports=bool(vars_dict["track_supports"].get()),
+            track_support_spacing_cm=num("track_support_spacing_cm", float),
             axis_mapping=vars_dict["axis_mapping"].get().strip(),
             samples_per_segment=num("samples_per_segment", int),
             resample_spacing_m=num("resample_spacing_m", float),

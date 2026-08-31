@@ -1,15 +1,18 @@
-# UE5 Coaster Pipeline From OpenFVD / NoLimits Export
+# UE5 Coaster Pipeline From OpenFVD / NoLimits 2 Export
 
-Converts exported OpenFVD / NoLimits `.nlelem` track data into a JSON bundle that
+Converts exported OpenFVD or NoLimits 2 track data into a JSON bundle that
 Unreal drives directly, with correct real-world scale and physically meaningful
 forces.
 
 ## How it works now
 
 ```
-CoasterSpline.nlelem  ->  convert_nlelem_to_ue.py  ->  coaster_ue5_bundle.json
-   your car mesh ---------------^                    ->  CoasterCarAnimated.fbx
-                                                     ->  coaster_timeline.csv
+ OpenFVD .nlelem  \
+ NoLimits .nl2elem >->  convert_nlelem_to_ue.py  ->  coaster_ue5_bundle.json
+ NoLimits .csv    /            ^                  ->  CoasterCarAnimated.glb
+   your car mesh --------------'                  ->  CoasterCarAnimated.fbx
+                                                  ->  CoasterTrack.fbx
+                                                  ->  coaster_timeline.csv
                                                                 |
                                                       unreal_import_coaster.py
                                                       (run inside UE Editor)
@@ -28,6 +31,106 @@ from round-tripping through Blender:
 
 The old Blender scripts remain on disk but nothing calls them. See "Legacy FBX
 scripts" below.
+
+## Input formats
+
+Three, auto-detected from the file extension. Pick one; the others are not
+needed.
+
+| File | From | Tangent file needed | Accuracy |
+|---|---|---|---|
+| **`.csv`** spline export | NoLimits 2 | no | **exact** |
+| `.nl2elem` | NoLimits 2 | no | exact via its sibling CSV |
+| `.nlelem` | OpenFVD | yes, for banking | exact |
+
+### NoLimits 2 spline CSV - the best input
+
+Tab-separated, one row per station, with a position **and a complete
+orientation frame** per row:
+
+```
+"No."  "PosX" "PosY" "PosZ"  "FrontX".. "LeftX".. "UpX"..
+```
+
+Nothing is reconstructed. Positions come straight from the file and the up
+vector is authored rather than rebuilt from a roll angle, which is why the
+exported animation validates a shade tighter than the OpenFVD route: up-axis dot
+**min +1.00000** against +0.99995.
+
+Metres, Y up - the same convention as the element formats - so the same verified
+axis mapping applies. `Left = Up x Front` was confirmed on the sample.
+
+### NoLimits 2 `.nl2elem`
+
+XML, and self-contained in the sense you would expect: one file holds both the
+path (`<vertex>`) and the banking (`<roll>`, an orthonormal up/right pair at a
+normalised `coord`). No tangent file.
+
+**Point the converter at it and it works** - because it looks for the spline CSV
+that NoLimits exports alongside and uses that instead. The element's own
+`<description>` is checked first, since NoLimits names the CSV after the track
+rather than after the element file: `Coaster.nl2elem` with description
+`IndoorCoaster` finds `IndoorCoasterSpline.csv`.
+
+```
+Read Coaster.nl2elem -> using its spline export IndoorCoasterSpline.csv
+```
+
+#### Why the CSV is preferred, in detail
+
+The `.nl2elem` geometry itself could not be decoded reliably, and the reader
+says so rather than pretending otherwise. What was established from the sample:
+
+- The vertex count is an exact multiple of three (57 = 19 x 3).
+- After an X-Z swap the vertex bounds **contain** the resolved path's on every
+  axis (76 >= 75, 68 >= 41, 149 >= 140), and the vertex polyline is longer than
+  the path (1561 m against 1223 m). Both are the signature of control points
+  enclosing their curve, so the vertices are controls, not points on the track.
+- The roll frames are orthonormal, and `u` and `r` both sit ~90 degrees from the
+  tangent, which identifies `u x r` as the travel direction. At `coord` 0 and 1
+  that reproduces the tangent to **0.1 degrees**.
+
+What could not be established is the spline basis. Read as cubic Bezier triples
+- the layout the older binary format uses - the chain is **not C1 continuous**:
+corners of 72 to 145 degrees at the joints, where a real track has none. No
+offset or ordering tested fixes it, and only 1 of 55 consecutive vertex triples
+is even near-collinear. An earlier fit that looked promising (median 10.8
+degrees tangent error, against 27 to 49 for the alternatives) turned out to be
+coincidence, not structure.
+
+So with no CSV beside it the reader still runs, but it warns loudly, and the
+defect detection flags the reconstructed path as unusable on its own terms -
+every sample comes back `"suspect": true`. `--ignore-sibling-csv` forces that
+path for diagnosis. Do not ship from it.
+
+### The reference CSV is not one of these
+
+`--validate-reference-csv` is an optional cross-check, and it wants something
+different from all three inputs above: a spline exported **from Unreal, in
+centimetres**, of the same ride. It is what pinned the axis mapping down.
+
+Pointing it at a NoLimits source export is the easy mistake, since that is also
+a CSV with `PosX` columns. The converter now detects that and says so, rather
+than reporting a mapping failure:
+
+```
+NOTE: skipping axis validation. IndoorCoasterSpline.csv is a NoLimits 2 source
+export, not an Unreal-space reference. It is the converter's input, in metres,
+so comparing the conversion against it proves nothing.
+```
+
+It also refuses a reference whose extent looks like metres rather than
+centimetres, and checks that the reference is plausibly the same ride at all -
+a reference from a different track used to read as "your axis mapping is wrong",
+which would have led you to mirror a correct track.
+
+Validation is advisory throughout: a bad reference is reported and skipped, and
+never costs you the export.
+
+### OpenFVD `.nlelem`
+
+The original binary format. Needs the companion tangent file for banking; see
+"Source data defects" below for what this particular export contains.
 
 ## Scale
 
@@ -71,11 +174,39 @@ The previous default, `nl2_to_ue`, has determinant +1 and was mirrored.
 
 ### Speed
 
-There is no velocity data in the `.nlelem` export, so speed comes from an energy
-model: gravity, rolling friction, and drag. Tune with `--initial-speed`,
-`--rolling-friction`, `--drag-coeff`. **The speed profile is only as good as
-those three numbers** — if you can export real velocities from OpenFVD, they would
-replace this entirely and should.
+Neither the `.nlelem` export nor the NoLimits spline CSV carries velocity - the
+CSV is `PosX/Y/Z` plus the Front/Left/Up basis and nothing else - so speed comes
+from an energy model: gravity, rolling friction, and drag. Tune with
+`--initial-speed`, `--rolling-friction`, `--drag-coeff`. **The speed profile is
+only as good as those three numbers.** If you can export real velocities from
+either tool, they would replace this entirely and should.
+
+#### The lift hill is driven, not coasted
+
+Gravity cannot get a train up a lift, so a purely gravity-driven model has to
+catch the climb with a floor, and the train crawls. That was the single largest
+error in the ride's timing - on the reference ride it cost 19.5 s, 22% of the
+whole ride, spent at 1 m/s.
+
+So the model drives it. Wherever **the track is climbing and free-rolling would
+be slower than `--lift-speed`** (default 4.0 m/s), the train is taken to be on
+the chain or LSM and holds that speed exactly, which is what a real lift does.
+Everywhere else it rolls on energy alone. Longitudinal acceleration goes to zero
+across a driven section, which is also correct - a chain lift is constant speed.
+
+The converter prints what it decided, so the driven sections are inspectable
+rather than silently changing the ride time:
+
+```
+Duration 73.46s, length 1222.9m, speed 21.0/28.4 m/s (median/peak)
+Lift: 1 driven section(s) at 4.0 m/s, 5.1s of the ride (7%)
+      657-677 m:   5.1s, climbing +14.9 m
+```
+
+Set `--lift-speed` to your lift's real speed if you know it. `--lift-speed 0`
+models the ride as purely gravity-driven, which is physically honest but will
+make every climb crawl. `--min-speed` is now only a numerical floor for flat,
+undriven stretches - it is no longer what carries the train uphill.
 
 ### Curvature and force
 
@@ -145,7 +276,10 @@ export is self-contained:
 CoasterRawExportData/UE5/
   coaster_ue5_bundle.json     analytic path, timeline, forces, car settings
   coaster_timeline.csv        the same timeline as a table
-  CoasterCarAnimated.fbx      the car's motion as real keyframes
+  CoasterCarAnimated.glb      the car + its motion; drop this into Unreal
+  CoasterCarAnimated.fbx      the same motion for other tools
+  CoasterTrack.glb            the track; drop this into Unreal too
+  CoasterTrack.fbx            procedural rails, spine, ties and supports
   KexLSMfoSketchfab.glb       staged car mesh
 ```
 
@@ -192,6 +326,15 @@ sideways until **Faces along** is set to match, which is the one setting worth
 checking first if the car looks wrong. `Extra yaw` handles a mesh that is not
 quite square to its own axes.
 
+`auto` measures the mesh, and has to answer two questions. The long horizontal
+axis is easy. Which *end* of it is the nose is not - a bounding box cannot tell
+you, and guessing wrong drives the car round the track backwards while every
+numeric check still passes, because the path and the banking are both still
+correct. So `auto` also compares the two halves: a coaster car's nose is low and
+tapered while its back carries the seat backs, so the **taller half is the
+rear**. The converter prints what it decided (`facing -Y`); if it gets your car
+wrong, name the axis explicitly and it will not second-guess you.
+
 ### Why the orientation lives on the component
 
 The facing correction, offset and scale are applied to the mesh *component*,
@@ -208,11 +351,20 @@ nominal length, so a correctly-built 4.5 m car arrived as 2.25 m next to a
 true-scale track. Set `--car-expected-length-m` and the import will tell you
 the measured length and the exact scale factor needed to correct it.
 
-### No car set
+### The animated FBX carries your actual car
 
-A placeholder box roughly the size of a coaster car (4.5 x 1.6 x 1.2 m) is
-animated instead, so the motion is still visible and checkable. The import logs
-a warning saying so.
+`CoasterCarAnimated.fbx` is a **single-bone skeletal mesh of the car you
+selected**, with the ride baked onto that bone as keyframes. The car's triangles
+are read straight out of the `.glb` by `read_glb.py` and written into the FBX, so
+the file is self-contained - it does not reference the GLB.
+
+For the reference car that is 56,052 triangles at 5.21 x 2.28 x 2.83 m, and the
+mesh is auto-rotated so the car faces along travel (`--car-forward-axis auto`
+measures the bounds; pass `+X`/`+Y`/`-X`/`-Y` to override).
+
+**If no car mesh is given**, a box roughly the size of a coaster car is skinned
+and animated instead, so the motion is still visible and checkable. The import
+logs a warning saying so.
 
 ### The animation is a real file
 
@@ -271,6 +423,148 @@ one:
 python fbx_inspect.py CoasterCarAnimated.fbx AnimationCurve
 ```
 
+### Verified against Unreal, not just Blender
+
+Blender is a convenient independent reader but a forgiving one. Autodesk's FBX
+SDK - which Unreal's Interchange importer uses - is stricter, and rejected files
+Blender read without complaint:
+
+```
+Cannot open FBX file 'CoasterTrack.fbx'.
+FInterchangeFbxParser::LoadFbxFile: ... error when parsing the file.
+There was nothing to import from the provided source data.
+```
+
+The cause was the document preamble, all of which the SDK requires and Blender
+ignores: missing `FileId`, `CreationTime`, `CreationTimeStamp` and `SceneInfo`,
+an unnamed scene `Document`, and `RootNode` written as an int32 where it must be
+an int64.
+
+`verify_ue_import.py` now checks the exports against the real importer, headless
+and without saving anything:
+
+```powershell
+UnrealEditor-Cmd.exe "YourProject.uproject" -ExecutePythonScript="verify_ue_import.py" -unattended -nopause -nosplash -stdout
+```
+
+Current result on this export - four separate meshes, correct real-world bounds,
+no warnings:
+
+```
+RESULT CoasterTrack.fbx: 4 object(s) imported
+  StaticMesh: CoasterTrackRails     bounds 142.1 x 76.2 x 41.2 m
+  StaticMesh: CoasterTrackSpine     bounds 142.0 x 75.3 x 41.3 m
+  StaticMesh: CoasterTrackTies      bounds 142.3 x 76.2 x 41.4 m
+  StaticMesh: CoasterTrackSupports  bounds 141.5 x 75.3 x 40.6 m
+RESULT CoasterCarAnimated.fbx: 3 object(s) imported
+  SkeletalMesh: CoasterCarAnimated   bounds 5.21 x 2.28 x 2.83 m
+  Skeleton:     CoasterCarAnimated_Skeleton
+  PhysicsAsset: CoasterCarAnimated_PhysicsAsset
+```
+
+Unreal also warned that the meshes carried no smoothing groups. Harmless in
+itself, but it meant Unreal might compute normals rather than use the supplied
+ones - which would have rounded the crossties, whose corner vertices were
+shared. Box faces are now built independently so they read flat either way, and
+the warning is gone.
+
+### Import the two .glb files, not the .fbx files
+
+`CoasterCarAnimated.glb` and `CoasterTrack.glb` are written in the same space and
+land on top of each other with identity transforms. Place both actors at the
+world origin and the car runs on the track - measured at **13.6 cm median**
+between the car and the track centre line, which is just the sampling step.
+
+**Do not import CoasterTrack.fbx into Unreal.** Unreal's FBX importer mirrors
+the scene in Y. The track comes in as a mirror image of itself, which lines up
+with the glTF car nowhere - the two end up hundreds of metres apart. Worse, a
+mirror preserves every length, so the track passes every span and bounds check
+while being wrong; that is how it survived earlier verification. The `.fbx`
+files stay in the export for tools that read FBX correctly.
+
+### Just drag CoasterCarAnimated.glb into Unreal
+
+That single file gives you the car and the whole ride as an `AnimSequence`, with
+no script, no import settings and no project changes:
+
+| Asset | Type |
+|---|---|
+| `CoasterCarAnimated` | SkeletalMesh - your car, 5.21 x 2.28 x 2.83 m |
+| `CoasterCarAnimated_Skeleton` | Skeleton - `CoasterCarRig` -> `CoasterCarBone` |
+| `CoasterCarAnimated_Anim` | **AnimSequence** - the ride, 89.83 s |
+| `CoasterCarAnimated_PhysicsAsset` | PhysicsAsset |
+| `CoasterCarMaterial` | Material |
+
+Measured against the analytic path over 101 probes:
+
+| | median | p95 | max |
+|---|---|---|---|
+| position | 0.067 cm | 0.400 cm | 0.809 cm |
+| facing | 0.052 deg | 0.635 deg | 1.107 deg |
+| bank | 0.049 deg | 0.402 deg | 1.091 deg |
+
+The residual is Unreal resampling the 60 fps keys down to the project's 30 fps
+animation rate, not error in the export.
+
+**Why glTF and not FBX.** Unreal's FBX translator would not carry the animation
+across. With a correct skeleton, correct bind pose, Autodesk's own tangent
+encoding and a frame-aligned take, the legacy FBX importer does now build an
+`AnimSequence` from `CoasterCarAnimated.fbx` - but every key reads back as
+identity, and Interchange (the default in 5.8) builds no `AnimSequence` at all.
+The animation graph in that file is byte-for-byte equivalent to one Unreal
+exports itself, so the remaining difference is somewhere the records do not
+show. glTF has no such problem: Interchange reads skinned glTF animation
+natively, and the format is plain JSON plus typed buffers, so the file can be
+checked before it ever reaches the engine.
+
+Two things that are not optional in either format:
+
+- **The take must be frame-border aligned.** Unreal rejects any animation whose
+  length is not a whole number of frames at the project's animation rate. The
+  legacy importer says so - *"animation has to be frame-border aligned"* -
+  Interchange just drops the take silently. `--car-fbx-import-fps` (default 30)
+  is the rate to align to; set it to your project's Default Frame Rate if you
+  have changed it.
+- **The bind pose must agree with the skin.** Seeding the bone with the first
+  frame while the cluster matrices stay identity displaces the whole animation
+  by that offset - 55 m, in the reference ride.
+
+### What the import script gives you
+
+Measured, not assumed. Importing the bundle produces all of this:
+
+| Asset | Type | What it is |
+|---|---|---|
+| `CoasterCarAnimated` | SkeletalMesh | your car, one bone, 5.21 x 2.28 x 2.83 m |
+| `CoasterCarAnimated_Skeleton` | Skeleton | `CoasterCarRig` -> `CoasterCarBone` |
+| `CoasterCarAnim` | **AnimSequence** | the whole ride baked onto the bone |
+| `CoasterTrackRails` etc. | StaticMesh x4 | the procedural track |
+| `LS_CoasterRide` | LevelSequence | the same ride driving a placed actor |
+| `CoasterCar` | StaticMesh | the textured GLB import |
+
+The `AnimSequence` is **built by `unreal_import_coaster.py`, not read out of the
+FBX.** Unreal's FBX translator would not produce one from the exported file, and
+building it through `unreal.AnimationDataController` is both reliable and
+checkable, since the keys come straight from the bundle. Verified against the
+analytic path over 41 probes: **median 0.009 cm, p95 0.397 cm, max 0.686 cm.**
+
+Two details there were not optional:
+
+- **Every bone in the chain gets a track**, not just the driven one. A bone with
+  no keys is walked during compression anyway.
+- **Keys are written at the project's animation frame rate**, read from
+  `AnimationSettings.default_frame_rate` (30 fps by default), and the frame count
+  is floored so the play length is an exact whole number of frames. Anything else
+  is resampled to that rate, and a play length that is not frame-aligned at it
+  fails `check(IsNearlyZero(SampleFrameTime.GetSubFrame()))` in
+  `AnimCompressionTypes.cpp` - which crashes the editor on save, on a background
+  worker, several seconds after the import reports success. Writing at a higher
+  rate buys nothing, because the resample discards the extra keys.
+
+Both the `AnimSequence` and the Level Sequence describe the same motion; the
+Level Sequence keys every analytic sample rather than a fixed frame clock, so it
+stays the higher-resolution of the two.
+
 ### FBX or bundle?
 
 Both describe the same motion; use whichever suits the job.
@@ -278,7 +572,8 @@ Both describe the same motion; use whichever suits the job.
 | | FBX | Bundle + `unreal_import_coaster.py` |
 |---|---|---|
 | Portable outside Unreal | yes | no |
-| Carries your car mesh | no, a car-sized box | yes, the staged mesh |
+| Carries your car mesh | yes, embedded triangles | yes, the staged mesh |
+| Yields an AnimSequence | .glb yes, .fbx no | yes |
 | Time resolution | quantised to the chosen fps | every analytic sample |
 | Builds the track spline | no | yes |
 | Reports forces on import | no | yes |
@@ -292,6 +587,99 @@ export self-contained.
 Add a **CoasterAnalyzer** component to the `CoasterCar` actor with **Use Live
 Actor Tracking** enabled, then press Play. The import prints this reminder.
 
+## The track mesh
+
+`CoasterTrack.fbx` is generated track geometry swept along the converted path -
+not a rip of the original model, which the `.nlelem` export does not contain.
+Written by `export_track_mesh.py` through the same binary FBX writer as the
+animation.
+
+Four separate meshes, so each can take its own material in Unreal instead of
+arriving as one unassignable blob:
+
+| Mesh | What it is |
+|---|---|
+| `CoasterTrackRails` | The two running rails, swept tubes at the gauge |
+| `CoasterTrackSpine` | The central box beam below the rails |
+| `CoasterTrackTies` | Crossties from the spine out to both rails |
+| `CoasterTrackSupports` | Vertical columns down to ground level |
+
+For this ride that is 2,017 cross-sections over 806 m: **55,124 polygons**,
+57,848 vertices, 505 ties and 85 columns, in an 11 MB file.
+
+Every part carries smooth per-corner normals and a UV layer, so the rails shade
+as round tubes rather than faceted prisms and textures tile at a real-world rate
+(V advances one unit per metre of track).
+
+### The track is fitted to your car
+
+`--track-rail-drop-cm` and `--track-gauge-cm` both default to `auto`, which
+measures the car's bogies rather than assuming a value.
+
+A bogie grips the rail from both sides - road wheels on top, upstop wheels
+underneath - so the outboard running gear is spread roughly symmetrically about
+the rail line. Its vertical centre gives the rail height, and whatever sits at
+that height gives the gauge. The converter reports what it found:
+
+```
+track fit: rails -1.6 cm from the path, gauge 174.0 cm (measured from the car's bogies)
+```
+
+The old fixed defaults (110 cm drop, 100 cm gauge) assumed the path was a
+heartline and the car was narrow-gauge. For the reference car both are wrong: its
+rails belong at the path, 174 cm apart. The result was a car hovering above rails
+that were too low and too narrow - and nothing caught it, because the track and
+the animation were each individually correct and only disagreed with each other.
+
+Pass a number to either flag to override the measurement.
+
+### Where it sits
+
+The geometry is written in **absolute Unreal coordinates**, the same ones the
+car animation uses, so the track needs no alignment: `unreal_import_coaster.py`
+imports it and places each part at the origin with an identity transform, and
+the car runs on it. Verified by comparing the mesh bounds against the path:
+
+```
+axis    mesh span m   path span m  difference m
+X            260.49        260.44          0.05
+Y            164.59        163.98          0.61
+Z             45.17         44.65          0.52
+```
+
+X matches to 5 cm. Y is wider by the rail gauge, and Z is taller because the
+rails sit *above* the path through inversions and the columns run below it -
+both expected.
+
+### What the geometry assumes
+
+The path is treated as the **heartline**, which is what NoLimits and OpenFVD
+export, so the rails are placed below it by `--track-rail-drop-cm` (default
+110 cm) and the spine 35 cm below that. Adjust the drop and
+`--track-gauge-cm` to match the coaster type you are modelling.
+
+Support columns scale their radius with height, targeting a height-to-diameter
+ratio near 35. A fixed radius made a 44 m column read as a wire at ratio 160,
+where real coaster columns sit nearer 35.
+
+### What it is not
+
+The supports are plain verticals dropped to the lowest point of the ride. Real
+supports are angled bents chosen per element, so treat these as massing and
+shadow rather than an engineering claim - they can intersect track that passes
+underneath. Rails are round tubes; box-section and triangular-truss spines are
+not modelled.
+
+### Verifying it
+
+```powershell
+blender -b -P verify_track_mesh.py -- "...\CoasterTrack.fbx" "...\coaster_ue5_bundle.json"
+```
+
+Confirms every part imported, that the bounds match the path, that no vertex is
+non-finite, and that normals and UVs survived. Blender is used only as an
+independent reader.
+
 ## Run it
 
 ### GUI
@@ -304,8 +692,9 @@ Four tabs, LSU purple and gold, dark throughout:
 
 | Tab | Holds |
 |---|---|
-| **Files** | Spline (required), tangent, output folder, validation reference CSV |
+| **Files** | Track file (required), tangent, output folder, validation reference CSV |
 | **Car** | Car mesh, facing axis, yaw, scale, height offset, expected length, baked FBX |
+| **Track** | Procedural track: gauge, rail drop, detail and tie spacing, supports |
 | **Physics** | Initial speed, rolling friction, drag, curvature window and floor |
 | **Geometry** | Axis mapping, samples per segment, resample spacing, track mesh cleanup |
 | **Advanced** | Python interpreter, source-defect thresholds, spike filter tuning |
@@ -429,7 +818,11 @@ around 20% is inherent. Peak retention is the tight gate.
 | `convert_nlelem_to_ue.py` | `.nlelem` -> JSON bundle. The core tool. |
 | `unreal_import_coaster.py` | Run in UE Editor. Builds spline + Level Sequence. |
 | `coaster_pipeline_gui.py` | GUI front end. |
+| `fbx_writer.py` | Shared binary FBX 7.4 writer. Pure Python. |
+| `export_car_glb.py` | Writes CoasterCarAnimated.glb - the file Unreal imports as an animation. Pure Python. |
 | `export_car_animation.py` | Writes CoasterCarAnimated.fbx. Pure Python. |
+| `export_track_mesh.py` | Writes CoasterTrack.fbx. Pure Python. |
+| `verify_track_mesh.py` | Checks that track against the bundle (needs Blender). |
 | `verify_car_animation.py` | Checks that FBX against the bundle (needs Blender). |
 | `fbx_inspect.py` | Dumps a binary FBX record tree. Pure Python. |
 | `verify_baked_physics.py` | Legacy. FBX fidelity check (needs Blender). |

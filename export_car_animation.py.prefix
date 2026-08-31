@@ -23,9 +23,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from read_glb import GlbError, orient_forward, read_glb_triangles
 from fbx_writer import (
     FBX_TIME_ONE_SECOND,
-    KEY_VER,
+    KEY_ATTR_DATA,
+    KEY_ATTR_FLAGS,
     MeshBuilder,
-    key_attr_blocks,
     Node,
     _arr,
     _b,
@@ -122,18 +122,13 @@ def resample_uniform_fps(samples: List[Dict], fps: int) -> List[Dict]:
         return []
 
     duration = float(samples[-1]["time_s"])
-    # Floor, so every key time is exactly frame/fps. Rounding up puts the last
-    # frame past the end of the ride, where it gets clamped back to the source
-    # duration - leaving the final key off the frame grid, which is enough for
-    # Unreal to reject the whole take as not frame-border aligned.
-    frame_count = max(int(math.floor(duration * fps + 1e-9)) + 1, 2)
+    frame_count = max(int(round(duration * fps)) + 1, 2)
     times = [float(s["time_s"]) for s in samples]
 
     out = []
     cursor = 0
     for frame in range(frame_count):
-        t = frame / float(fps)
-        t = t if t <= duration else duration
+        t = min(frame / float(fps), duration)
         while cursor < len(times) - 2 and times[cursor + 1] < t:
             cursor += 1
 
@@ -178,13 +173,12 @@ def _curve(object_id, times_ticks, values):
         [_l(object_id), _s(obj_name("", "AnimCurve")), _s("")],
     )
     node.add(Node("Default", [_d(values[0] if values else 0.0)]))
-    node.add(Node("KeyVer", [_i(KEY_VER)]))
+    node.add(Node("KeyVer", [_i(4008)]))
     node.add(Node("KeyTime", [_arr("l", times_ticks)]))
     node.add(Node("KeyValueFloat", [_arr("f", values)]))
-    flags, refs, attr_data = key_attr_blocks(len(times_ticks))
-    node.add(Node("KeyAttrFlags", [_arr("i", flags)]))
-    node.add(Node("KeyAttrDataFloat", [_arr("f", attr_data)]))
-    node.add(Node("KeyAttrRefCount", [_arr("i", refs)]))
+    node.add(Node("KeyAttrFlags", [_arr("i", [KEY_ATTR_FLAGS])]))
+    node.add(Node("KeyAttrDataFloat", [_arr("f", KEY_ATTR_DATA)]))
+    node.add(Node("KeyAttrRefCount", [_arr("i", [len(times_ticks)])]))
     return node
 
 
@@ -243,25 +237,14 @@ def _transform_model(object_id, name, subclass, position=None, rotation=None):
     return model
 
 
-# What Autodesk's own exporter writes for each node kind. The root of a skeleton
-# is "Root", not "Null": a Null is not a joint, and Unreal's FBX translator will
-# not treat an animated chain hanging off one as a skeletal animation.
-TYPE_FLAGS = {
-    "Root": ("Null", "Skeleton", "Root"),
-    "LimbNode": ("Skeleton",),
-    "Null": ("Null",),
-}
-
-
 def _node_attribute(object_id, name, kind):
     """Marks a node as a skeleton root or a bone."""
     attr = Node(
         "NodeAttribute",
         [_l(object_id), _s(obj_name(name, "NodeAttribute")), _s(kind)],
     )
-    flags = TYPE_FLAGS.get(kind, ("Null",))
-    attr.add(Node("TypeFlags", [_s(f) for f in flags]))
-    if kind in ("LimbNode", "Root"):
+    attr.add(Node("TypeFlags", [_s("Skeleton" if kind == "LimbNode" else "Null")]))
+    if kind == "LimbNode":
         props = attr.add(Node("Properties70"))
         props.add(prop70("Size", "double", "Number", "", _d(100.0)))
     return attr
@@ -347,22 +330,6 @@ def _car_geometry(object_id, box_size_cm, car_mesh_file, car_forward_axis):
     return node, count, "placeholder box"
 
 
-def trim_to_frame_border(frames, fps: int, import_fps: int):
-    """Drop trailing frames until the length is whole at both frame rates.
-
-    A take of N frames at fps runs (N-1)/fps seconds, and that has to be a whole
-    number of frames at import_fps too. Costs at most one frame when exporting
-    at 60fps for Unreal's default 30fps.
-    """
-    fps = max(int(fps), 1)
-    import_fps = max(int(import_fps), 1)
-    step = fps // math.gcd(fps, import_fps)
-    if step <= 1:
-        return frames
-    keep = ((len(frames) - 1) // step) * step + 1
-    return frames[:keep] if keep >= 2 else frames
-
-
 def write_car_animation_fbx(
     path,
     samples: List[Dict],
@@ -372,7 +339,6 @@ def write_car_animation_fbx(
     creator: str = "UE5 Coaster Pipeline",
     car_mesh_file: Optional[str] = None,
     car_forward_axis: str = "auto",
-    import_fps: int = 30,
 ) -> Dict:
     """Write the baked car motion to a binary FBX. Returns a summary dict.
 
@@ -384,14 +350,6 @@ def write_car_animation_fbx(
     frames = resample_uniform_fps(samples, fps)
     if len(frames) < 2:
         raise ValueError("Not enough samples to write an animation")
-
-    # Unreal refuses any take whose length is not a whole number of frames at
-    # its own animation frame rate (Project Settings > Animation > Default Frame
-    # Rate, 30 by default). The legacy importer says so out loud - "animation
-    # has to be frame-border aligned" - while Interchange just drops the take
-    # and hands you a skeletal mesh with no AnimSequence, which is why this was
-    # so quiet. So end on a boundary shared by both rates.
-    frames = trim_to_frame_border(frames, fps, import_fps)
 
     times_ticks = [
         int(round(f["time_s"] * FBX_TIME_ONE_SECOND)) for f in frames
@@ -417,16 +375,9 @@ def write_car_animation_fbx(
     pose_id = 1300000
     stack_id, layer_id = 2000000, 2100000
     node_t, node_r, node_s = 3000000, 3100000, 3200000
-    # The root joint gets its own constant T/R/S. Unreal keys a skeletal
-    # animation off the root, so a root with no curves reads as "no animation"
-    # however complete the child bone's curves are.
-    root_t, root_r, root_s = 3300000, 3400000, 3500000
     curves_t = [4000000, 4000001, 4000002]
     curves_r = [4100000, 4100001, 4100002]
     curves_s = [4200000, 4200001, 4200002]
-    curves_root_t = [4300000, 4300001, 4300002]
-    curves_root_r = [4400000, 4400001, 4400002]
-    curves_root_s = [4500000, 4500001, 4500002]
 
     first_pos = [translations[a][0] for a in range(3)]
     first_rot = [rotations[a][0] for a in range(3)]
@@ -438,8 +389,7 @@ def write_car_animation_fbx(
 
     rig_name = f"{node_name}Rig"
     bone_name = f"{node_name}Bone"
-    take_name = "CoasterRide"
-    layer_name = "Base Layer"
+    take_name = f"{node_name}|CoasterRide"
 
     roots: List[Node] = []
     roots.extend(header_nodes(creator))
@@ -454,20 +404,18 @@ def write_car_animation_fbx(
             "Pose": 1,
             "AnimationStack": 1,
             "AnimationLayer": 1,
-            "AnimationCurveNode": 6,
-            "AnimationCurve": 18,
+            "AnimationCurveNode": 3,
+            "AnimationCurve": 9,
         })
     )
 
     objects = Node("Objects")
-    objects.add(_transform_model(rig_id, rig_name, "Root"))
-    objects.add(_node_attribute(rig_attr_id, rig_name, "Root"))
-    # The bone rests at the origin, which is where the car mesh is authored and
-    # what the cluster's identity Transform/TransformLink declare. Seeding it
-    # with the first frame instead leaves the bind pose disagreeing with the
-    # skin by the whole first-frame offset, and Unreal imports the animation
-    # displaced by exactly that much - 55 m, in the reference ride.
-    objects.add(_transform_model(bone_id, bone_name, "LimbNode"))
+    objects.add(_transform_model(rig_id, rig_name, "Null"))
+    objects.add(_node_attribute(rig_attr_id, rig_name, "Null"))
+    # The bone carries the motion; its defaults are the first frame.
+    objects.add(
+        _transform_model(bone_id, bone_name, "LimbNode", first_pos, first_rot)
+    )
     objects.add(_node_attribute(bone_attr_id, bone_name, "LimbNode"))
     objects.add(_transform_model(mesh_id, node_name, "Mesh"))
     objects.add(geometry_node)
@@ -483,28 +431,18 @@ def write_car_animation_fbx(
     sprops.add(prop70("ReferenceStop", "KTime", "Time", "", _l(stop_ticks)))
 
     objects.add(
-        Node("AnimationLayer", [_l(layer_id), _s(obj_name(layer_name, "AnimLayer")), _s("")])
+        Node("AnimationLayer", [_l(layer_id), _s(obj_name(take_name, "AnimLayer")), _s("")])
     )
     objects.add(_curve_node(node_t, "T", first_pos))
     objects.add(_curve_node(node_r, "R", first_rot))
     objects.add(_curve_node(node_s, "S", (1.0, 1.0, 1.0)))
-    objects.add(_curve_node(root_t, "T", (0.0, 0.0, 0.0)))
-    objects.add(_curve_node(root_r, "R", (0.0, 0.0, 0.0)))
-    objects.add(_curve_node(root_s, "S", (1.0, 1.0, 1.0)))
     for axis in range(3):
         objects.add(_curve(curves_t[axis], times_ticks, translations[axis]))
     for axis in range(3):
         objects.add(_curve(curves_r[axis], times_ticks, rotations[axis]))
-    # Constant channels need only the two end keys.
-    ends = [times_ticks[0], times_ticks[-1]]
+    scale_times = [times_ticks[0], times_ticks[-1]]
     for axis in range(3):
-        objects.add(_curve(curves_s[axis], ends, [1.0, 1.0]))
-    for axis in range(3):
-        objects.add(_curve(curves_root_t[axis], ends, [0.0, 0.0]))
-    for axis in range(3):
-        objects.add(_curve(curves_root_r[axis], ends, [0.0, 0.0]))
-    for axis in range(3):
-        objects.add(_curve(curves_root_s[axis], ends, [1.0, 1.0]))
+        objects.add(_curve(curves_s[axis], scale_times, [1.0, 1.0]))
     roots.append(objects)
 
     connections = Node("Connections")
@@ -527,17 +465,14 @@ def write_car_animation_fbx(
 
     connect(layer_id, stack_id)
     channels = ("d|X", "d|Y", "d|Z")
-    for target, curve_node, prop, curve_ids in (
-        # Onto the joints, not the mesh: that is what becomes an AnimSequence.
-        (bone_id, node_t, "Lcl Translation", curves_t),
-        (bone_id, node_r, "Lcl Rotation", curves_r),
-        (bone_id, node_s, "Lcl Scaling", curves_s),
-        (rig_id, root_t, "Lcl Translation", curves_root_t),
-        (rig_id, root_r, "Lcl Rotation", curves_root_r),
-        (rig_id, root_s, "Lcl Scaling", curves_root_s),
+    for curve_node, prop, curve_ids in (
+        (node_t, "Lcl Translation", curves_t),
+        (node_r, "Lcl Rotation", curves_r),
+        (node_s, "Lcl Scaling", curves_s),
     ):
         connect(curve_node, layer_id)
-        connect(curve_node, target, prop)
+        # Onto the bone, not the mesh: that is what can become an AnimSequence.
+        connect(curve_node, bone_id, prop)
         for axis in range(3):
             connect(curve_ids[axis], curve_node, channels[axis])
     roots.append(connections)
@@ -552,7 +487,6 @@ def write_car_animation_fbx(
         "fps": fps,
         "frames": len(frames),
         "duration_s": frames[-1]["time_s"],
-        "import_fps": import_fps,
         "node_name": node_name,
         "bone_name": bone_name,
         "geometry": geometry_note,

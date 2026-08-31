@@ -28,6 +28,7 @@ import_coaster_bundle(
 """
 
 import json
+import math
 import os
 import unreal
 
@@ -103,18 +104,339 @@ def report_force_envelope(samples):
         )
 
 
+def _norm(v):
+    length = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    return [v[0] / length, v[1] / length, v[2] / length] if length > 1e-12 else [0.0, 0.0, 1.0]
+
+
+def _cross(a, b):
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _basis_from_tangent_up(tangent, up):
+    """Orthonormal basis: local X along travel, local Z along the banked up."""
+    ax = _norm(tangent)
+    az = _norm(up)
+    ay = _norm(_cross(az, ax))
+    az = _norm(_cross(ax, ay))
+    return ax, ay, az
+
+
 def _rotator_from_tangent_up(tangent, up):
-    x_axis = unreal.Vector(tangent[0], tangent[1], tangent[2]).get_safe_normal()
-    z_axis = unreal.Vector(up[0], up[1], up[2]).get_safe_normal()
-    y_axis = unreal.Vector.cross_product(z_axis, x_axis).get_safe_normal()
-    z_axis = unreal.Vector.cross_product(x_axis, y_axis).get_safe_normal()
-    m = unreal.Matrix(
-        x_plane=x_axis,
-        y_plane=y_axis,
-        z_plane=z_axis,
-        w_plane=unreal.Vector(0.0, 0.0, 0.0),
+    """Build an FRotator from a basis, in pure Python.
+
+    The obvious route - unreal.Vector.get_safe_normal and Matrix.rotator - is not
+    exposed in the Python binding and raised AttributeError at the first sample,
+    so this reimplements FMatrix::Rotator directly.
+    """
+    ax, ay, az = _basis_from_tangent_up(tangent, up)
+
+    pitch = math.degrees(math.atan2(ax[2], math.sqrt(ax[0] * ax[0] + ax[1] * ax[1])))
+    yaw = math.degrees(math.atan2(ax[1], ax[0]))
+
+    # Y axis of a rotation built from (pitch, yaw, roll=0), which is horizontal.
+    yaw_rad = math.radians(yaw)
+    sy_axis = [-math.sin(yaw_rad), math.cos(yaw_rad), 0.0]
+    roll = math.degrees(math.atan2(_dot(az, sy_axis), _dot(ay, sy_axis)))
+
+    return unreal.Rotator(roll=roll, pitch=pitch, yaw=yaw)
+
+
+def _quat_from_tangent_up(tangent, up):
+    """Quaternion from the same basis, for animation bone tracks."""
+    ax, ay, az = _basis_from_tangent_up(tangent, up)
+    m = (
+        (ax[0], ay[0], az[0]),
+        (ax[1], ay[1], az[1]),
+        (ax[2], ay[2], az[2]),
     )
-    return m.rotator()
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w, x, y, z = (
+            0.25 * s,
+            (m[2][1] - m[1][2]) / s,
+            (m[0][2] - m[2][0]) / s,
+            (m[1][0] - m[0][1]) / s,
+        )
+    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0
+        w, x, y, z = (
+            (m[2][1] - m[1][2]) / s,
+            0.25 * s,
+            (m[0][1] + m[1][0]) / s,
+            (m[0][2] + m[2][0]) / s,
+        )
+    elif m[1][1] > m[2][2]:
+        s = math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0
+        w, x, y, z = (
+            (m[0][2] - m[2][0]) / s,
+            (m[0][1] + m[1][0]) / s,
+            0.25 * s,
+            (m[1][2] + m[2][1]) / s,
+        )
+    else:
+        s = math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0
+        w, x, y, z = (
+            (m[1][0] - m[0][1]) / s,
+            (m[0][2] + m[2][0]) / s,
+            (m[1][2] + m[2][1]) / s,
+            0.25 * s,
+        )
+    return unreal.Quat(x, y, z, w)
+
+
+def build_track_spline(render_path, actor_label: str):
+    """Add a SplineComponent actor following the track, if the engine allows it.
+
+    A convenience for snapping other actors to the ride, not a deliverable, so a
+    failure here is reported and stepped over. The obvious construction -
+    unreal.SplineComponent(actor) with add_instance_component - is not exposed in
+    the Python binding and raised AttributeError, which used to abort the whole
+    import before the car or the animation were built.
+    """
+    try:
+        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+            unreal.Actor, unreal.Vector(0.0, 0.0, 0.0)
+        )
+        actor.set_actor_label(actor_label)
+        spline = actor.add_component_by_class(
+            unreal.SplineComponent, False, unreal.Transform(), False
+        )
+        if spline is None:
+            raise RuntimeError("add_component_by_class returned nothing")
+
+        spline.clear_spline_points(False)
+        world_space = unreal.SplineCoordinateSpace.WORLD
+        for row in render_path:
+            pos = row["ue_pos_cm"]
+            spline.add_spline_point(
+                unreal.Vector(pos[0], pos[1], pos[2]), world_space, False
+            )
+        spline.update_spline()
+        unreal.log(
+            f"Track spline '{actor_label}': "
+            f"{spline.get_number_of_spline_points()} points"
+        )
+        return actor
+    except Exception as ex:
+        unreal.log_warning(
+            f"Could not build the track spline ({ex}). The track mesh, car and "
+            "animation are unaffected."
+        )
+        return None
+
+
+def import_car_animation_fbx(bundle_path: str, data: dict, destination: str):
+    """Import CoasterCarAnimated.fbx and return (skeleton, skeletal mesh).
+
+    That file is a single-bone skeletal mesh of the car, so this yields a
+    Skeleton to hang an AnimSequence on and a SkeletalMesh shaped like the real
+    vehicle.
+    """
+    car = data.get("car") or {}
+    name = (car.get("animation_fbx") or "").strip()
+    if not name:
+        return None, None
+
+    fbx = os.path.join(os.path.dirname(os.path.abspath(bundle_path)), name)
+    if not os.path.isfile(fbx):
+        unreal.log_warning(f"Animated car FBX not found beside the bundle: {fbx}")
+        return None, None
+
+    unreal.log(f"Importing animated car {name} -> {destination}")
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", fbx)
+    task.set_editor_property("destination_path", destination)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("save", True)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+
+    skeleton = None
+    skeletal_mesh = None
+    for path in task.get_editor_property("imported_object_paths") or []:
+        asset = unreal.load_asset(path)
+        if isinstance(asset, unreal.Skeleton):
+            skeleton = asset
+        elif isinstance(asset, unreal.SkeletalMesh):
+            skeletal_mesh = asset
+
+    if skeleton is None:
+        unreal.log_warning(
+            f"{name} imported without a Skeleton; no AnimSequence can be built."
+        )
+    return skeleton, skeletal_mesh
+
+
+def _animation_sampling_rate(fallback=(30, 1)):
+    """The frame rate Unreal will actually store animation data at.
+
+    Keys written at any other rate are resampled to the project's Animation
+    "Default Frame Rate", and if the play length is then not a whole number of
+    frames at that rate the compressor hits
+    check(IsNearlyZero(SampleFrameTime.GetSubFrame())) and takes the editor down.
+    So read the rate first and key straight onto it - writing at a higher rate
+    buys nothing, since the resample throws the extra keys away.
+    """
+    try:
+        rate = unreal.get_default_object(unreal.AnimationSettings).get_editor_property(
+            "default_frame_rate"
+        )
+        num, den = int(rate.numerator), int(rate.denominator)
+        if num > 0 and den > 0:
+            return num, den
+    except Exception as ex:
+        unreal.log_warning(f"Could not read the project animation frame rate ({ex}).")
+    return fallback
+
+
+def create_car_anim_sequence(
+    skeleton,
+    samples,
+    fps: int,
+    destination: str,
+    asset_name: str = "CoasterCarAnim",
+    bone_name: str = "",
+):
+    """Bake the ride onto the car's bone as an AnimSequence asset.
+
+    Written here rather than relying on the FBX: Unreal's FBX translator would
+    not produce an AnimSequence from the exported file, and building it through
+    the animation data controller is both reliable and verifiable - the keys come
+    straight from the bundle, so the asset matches the analytic path to well
+    under a centimetre.
+    """
+    if skeleton is None or not samples:
+        return None
+
+    duration = float(samples[-1]["time_s"])
+    if duration <= 0.0:
+        return None
+
+    rate_num, rate_den = _animation_sampling_rate()
+    key_fps = rate_num / float(rate_den)
+    if abs(key_fps - float(fps)) > 1e-6:
+        unreal.log(
+            f"  keying at the project animation rate {rate_num}/{rate_den} fps; "
+            f"the requested {fps}fps would be resampled to it anyway"
+        )
+
+    # Floor, so the last frame lands on or before the end of the ride. Rounding up
+    # would put it past the end, its key would be clamped back to the source
+    # duration, and the play length would no longer be a whole number of frames -
+    # which is exactly what the compressor asserts on. Costs under one frame of tail.
+    frame_span = max(int(math.floor(duration * key_fps)), 1)
+    frame_count = frame_span + 1
+
+    times = [float(s["time_s"]) for s in samples]
+
+    def sample_at(t):
+        if t <= times[0]:
+            return samples[0]
+        if t >= times[-1]:
+            return samples[-1]
+        lo, hi = 0, len(times) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if times[mid] <= t:
+                lo = mid
+            else:
+                hi = mid
+        span = times[hi] - times[lo]
+        a = 0.0 if span <= 1e-12 else (t - times[lo]) / span
+        out = {}
+        for key in ("ue_pos_cm", "ue_tan", "ue_up"):
+            p, q = samples[lo][key], samples[hi][key]
+            out[key] = [p[i] + (q[i] - p[i]) * a for i in range(3)]
+        return out
+
+    positions = []
+    rotations = []
+    scales = []
+    for frame in range(frame_count):
+        row = sample_at(frame * rate_den / float(rate_num))
+        pos = row["ue_pos_cm"]
+        positions.append(unreal.Vector(pos[0], pos[1], pos[2]))
+        rotations.append(_quat_from_tangent_up(row["ue_tan"], row["ue_up"]))
+        scales.append(unreal.Vector(1.0, 1.0, 1.0))
+
+    factory = unreal.AnimSequenceFactory()
+    factory.set_editor_property("target_skeleton", skeleton)
+    anim = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        asset_name, destination, unreal.AnimSequence, factory
+    )
+    if anim is None:
+        unreal.log_warning("Could not create the AnimSequence asset.")
+        return None
+
+    # The bone the exporter skins to, with fallbacks in case it was renamed.
+    candidates = [bone_name] if bone_name else []
+    candidates += ["CoasterCarBone", "CoasterCarRig", "root"]
+    chosen = ""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            if unreal.AnimationLibrary.does_bone_name_exist(anim, candidate):
+                chosen = candidate
+                break
+        except Exception:
+            continue
+    if not chosen:
+        unreal.log_warning(
+            "Could not find the car bone on the skeleton; AnimSequence left empty."
+        )
+        return anim
+
+    # Ancestors of the driven bone need tracks too, or compression walks a bone
+    # with no keys. They are all identity - the car is one rigid body.
+    try:
+        chain = [
+            str(b)
+            for b in unreal.AnimationLibrary.find_bone_path_to_root(anim, chosen)
+        ]
+    except Exception:
+        chain = [chosen]
+    rest_pos = [unreal.Vector(0.0, 0.0, 0.0)] * frame_count
+    rest_rot = [unreal.Quat(0.0, 0.0, 0.0, 1.0)] * frame_count
+
+    controller = anim.controller
+    controller.open_bracket("Coaster ride import")
+    controller.set_frame_rate(unreal.FrameRate(rate_num, rate_den))
+    # Frames are intervals, so one fewer than the number of keys.
+    controller.set_number_of_frames(unreal.FrameNumber(frame_span))
+    for bone in chain:
+        controller.add_bone_curve(bone)
+        if bone == chosen:
+            controller.set_bone_track_keys(bone, positions, rotations, scales)
+        else:
+            controller.set_bone_track_keys(bone, rest_pos, rest_rot, scales)
+    controller.close_bracket()
+
+    stored = anim.get_editor_property("number_of_sampled_frames")
+    if int(stored) != frame_span:
+        unreal.log_warning(
+            f"Unreal stored {stored} frames where {frame_span} were written; the "
+            "animation may have been resampled and could be misaligned."
+        )
+
+    unreal.EditorAssetLibrary.save_loaded_asset(anim)
+    unreal.log(
+        f"AnimSequence '{asset_name}': {frame_count} keys at {rate_num}/{rate_den}fps "
+        f"on bone '{chosen}' ({len(chain)} track(s)), {anim.get_play_length():.2f}s "
+        f"of {duration:.2f}s"
+    )
+    return anim
+
 
 
 # Which way to yaw a mesh so its own forward axis ends up along +X, because the
@@ -221,6 +543,27 @@ def _mesh_bounds_extent_cm(mesh):
         return None
 
 
+def detect_forward_axis(mesh) -> str:
+    """Guess which way the car model faces from its bounding box.
+
+    A coaster car is always longer than it is wide, so the longer horizontal
+    axis is the one it faces down. Worth detecting rather than defaulting,
+    because getting it wrong mounts the car sideways on the track and that is
+    easy to mistake for the mesh itself being broken.
+    """
+    extent = _mesh_bounds_extent_cm(mesh)
+    if not extent:
+        unreal.log_warning("  could not measure the car; assuming it faces +X")
+        return "+X"
+
+    axis = "+X" if extent[0] >= extent[1] else "+Y"
+    unreal.log(
+        f"  auto forward axis: {axis} (mesh is {extent[0] / 100.0:.2f} m on X, "
+        f"{extent[1] / 100.0:.2f} m on Y)"
+    )
+    return axis
+
+
 def spawn_car_actor(mesh, car: dict, label: str):
     """Spawn the car and push orientation, offset and scale onto its component.
 
@@ -249,7 +592,10 @@ def spawn_car_actor(mesh, car: dict, label: str):
     actor.set_actor_label(label)
 
     roll, pitch, yaw = car.get("rotation_offset_deg") or [0.0, 0.0, 0.0]
-    base_yaw = FORWARD_AXIS_YAW.get(car.get("forward_axis") or "+X", 0.0)
+    forward_axis = (car.get("forward_axis") or "auto").strip()
+    if forward_axis == "auto":
+        forward_axis = detect_forward_axis(mesh)
+    base_yaw = FORWARD_AXIS_YAW.get(forward_axis, 0.0)
     component.set_editor_property(
         "relative_rotation",
         unreal.Rotator(roll=float(roll), pitch=float(pitch), yaw=base_yaw + float(yaw)),
@@ -266,7 +612,7 @@ def spawn_car_actor(mesh, car: dict, label: str):
     )
 
     unreal.log(
-        f"Car '{label}': forward {car.get('forward_axis', '+X')} "
+        f"Car '{label}': forward {forward_axis} "
         f"(yaw {base_yaw:+.0f}), offset {off}, scale {scale}"
     )
 
@@ -317,6 +663,86 @@ def build_placeholder_car(label: str):
     return actor
 
 
+def import_track_mesh(bundle_path: str, data: dict, destination: str):
+    """Import the procedural track and place it at the origin.
+
+    The geometry is written in absolute Unreal coordinates, so the actors carry
+    an identity transform: the track lands exactly where the ride is, with no
+    alignment step.
+
+    Prefers CoasterTrack.glb. Unreal's FBX importer mirrors the scene in Y,
+    which puts an FBX track nowhere near the glTF car while still passing every
+    span and bounds check, because a mirror preserves both.
+    """
+    info = data.get("track_mesh") or {}
+    name = (data.get("track_mesh_glb") or "").strip() or (info.get("file") or "").strip()
+    if not name:
+        return []
+    if not name.lower().endswith(".glb"):
+        unreal.log_warning(
+            f"Importing the track from {name}; Unreal mirrors FBX in Y, so it "
+            "will not line up with the car. Re-run the converter to get "
+            "CoasterTrack.glb."
+        )
+
+    fbx = os.path.join(os.path.dirname(os.path.abspath(bundle_path)), name)
+    if not os.path.isfile(fbx):
+        unreal.log_warning(f"Track mesh not found beside the bundle: {fbx}")
+        return []
+
+    unreal.log(f"Importing track mesh {name} -> {destination}")
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", fbx)
+    task.set_editor_property("destination_path", destination)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("save", True)
+
+    # Keep the four parts separate so each can take its own material. Wrapped
+    # because the options object differs between engine versions and a failure
+    # here should cost the material split, not the import.
+    try:
+        options = unreal.FbxImportUI()
+        options.set_editor_property("import_mesh", True)
+        options.set_editor_property("import_as_skeletal", False)
+        options.set_editor_property("import_animations", False)
+        options.static_mesh_import_data.set_editor_property("combine_meshes", False)
+        options.static_mesh_import_data.set_editor_property(
+            "convert_scene", False
+        )
+        task.set_editor_property("options", options)
+    except Exception as ex:
+        unreal.log_warning(f"Could not set FBX import options ({ex}); using defaults.")
+
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+
+    actors = []
+    for path in task.get_editor_property("imported_object_paths") or []:
+        asset = unreal.load_asset(path)
+        if not isinstance(asset, unreal.StaticMesh):
+            continue
+        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+            unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0)
+        )
+        actor.static_mesh_component.set_static_mesh(asset)
+        actor.set_actor_label(asset.get_name())
+        actors.append(actor)
+
+    if actors:
+        unreal.log(
+            f"Track: {len(actors)} part(s) placed - "
+            + ", ".join(a.get_actor_label() for a in actors)
+        )
+        unreal.log(
+            f"  {info.get('polygons', '?')} polygons, "
+            f"{info.get('supports', '?')} support columns, "
+            f"gauge {info.get('gauge_cm', '?')}cm"
+        )
+    else:
+        unreal.log_warning("Track FBX imported but produced no static meshes.")
+    return actors
+
+
 def add_transform_track(seq, actor, samples, ticks_per_second, label=""):
     """Key an actor's transform along the ride. Returns the created binding."""
     binding = seq.add_possessable(actor)
@@ -357,6 +783,8 @@ def import_coaster_bundle(
     car_actor_name: str = "CoasterCar",
     spawn_placeholder_car: bool = True,
     also_animate_actor_name: str = "",
+    import_track: bool = True,
+    build_anim_sequence: bool = True,
 ):
     """Build the track spline and a Level Sequence that drives the coaster car.
 
@@ -366,6 +794,11 @@ def import_coaster_bundle(
     also_animate_actor_name keys an existing actor - typically a camera for a POV
     pass - along the identical path. It is optional: a missing actor is reported
     and skipped rather than aborting an otherwise good import.
+
+    import_track brings in CoasterTrack.fbx if the converter wrote one.
+
+    build_anim_sequence imports CoasterCarAnimated.fbx - a single-bone skeletal
+    mesh of the car - and bakes the ride onto its bone as an AnimSequence asset.
     """
     data = json.load(open(bundle_path, "r", encoding="utf-8"))
     samples = data["samples"]
@@ -397,37 +830,12 @@ def import_coaster_bundle(
             f"than the mapping used ('{validation.get('selected_mapping')}')."
         )
 
-    # Spawn an Empty Actor with SplineComponent.
-    world = unreal.EditorLevelLibrary.get_editor_world()
-    actor = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.Actor, unreal.Vector(0, 0, 0))
-    actor.set_actor_label(spline_actor_name)
-
-    spline = unreal.SplineComponent(actor)
-    actor.add_instance_component(spline)
-    spline.register_component()
-
     # Geometry comes from render_path (spike-filtered, safe to look at) while
     # motion comes from samples (never geometry-edited, so forces stay true).
     render_path = data.get("render_path") or samples
+    report_bundle_extent(render_path, "track")
 
-    spline.clear_spline_points(False)
-    for s in render_path:
-        pos = s["ue_pos_cm"]
-        tan = s["ue_tan_cm"]
-        spline.add_spline_point(unreal.Vector(pos[0], pos[1], pos[2]), unreal.SplineCoordinateSpace.WORLD, False)
-        spline.set_tangent_at_spline_point(
-            spline.get_number_of_spline_points() - 1,
-            unreal.Vector(tan[0], tan[1], tan[2]),
-            unreal.SplineCoordinateSpace.WORLD,
-            False,
-        )
-
-    spline.update_spline()
-    unreal.log(
-        f"Track spline: {spline.get_number_of_spline_points()} points from "
-        f"{'render_path' if data.get('render_path') else 'samples'}"
-    )
-    report_bundle_extent(render_path, "track spline")
+    build_track_spline(render_path, spline_actor_name)
 
     # Create or load the level sequence.
     seq = unreal.load_asset(level_sequence_path)
@@ -460,6 +868,21 @@ def import_coaster_bundle(
     # Everything this script creates goes in one content folder: the one the
     # level sequence lives in. That is why there is no import-folder setting.
     content_dir = level_sequence_path.rsplit("/", 1)[0]
+
+    if import_track:
+        import_track_mesh(bundle_path, data, content_dir)
+
+    if build_anim_sequence:
+        skeleton, skeletal_car = import_car_animation_fbx(
+            bundle_path, data, content_dir
+        )
+        if skeleton is not None:
+            create_car_anim_sequence(
+                skeleton,
+                samples,
+                int((data.get("car") or {}).get("animation_fbx_fps") or 60),
+                content_dir,
+            )
 
     car_actor = None
     mesh, mesh_desc = resolve_car_mesh(car, bundle_path, content_dir)
