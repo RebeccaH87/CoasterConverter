@@ -23,9 +23,17 @@ APP_NAME = "UE5 Coaster Pipeline"
 IS_FROZEN = getattr(sys, "frozen", False)
 SCRIPT_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SCRIPT_DIR))
-APP_STATE_DIR = Path(
-    os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
-) / "UE5_CoasterPipeline"
+
+
+def _default_app_state_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+
+
+APP_STATE_DIR = _default_app_state_dir() / "UE5_CoasterPipeline"
 CONVERTER_SCRIPT = RESOURCE_DIR / "convert_nlelem_to_ue.py"
 STATE_FILE = APP_STATE_DIR / ".gui_state.json"
 
@@ -1345,7 +1353,12 @@ def launch_gui() -> None:
         if not out.exists():
             messagebox.showwarning(APP_NAME, "Output folder does not exist yet.")
             return
-        subprocess.Popen(["explorer", str(out)])
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(out)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(out)])
+        else:
+            subprocess.Popen(["xdg-open", str(out)])
 
     run_btn.configure(command=on_run)
     save_btn.configure(command=on_save)
