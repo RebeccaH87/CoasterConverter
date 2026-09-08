@@ -711,198 +711,6 @@ def recompute_samples_orientation(samples: List[Dict], axis_mapping: str) -> Non
         samples[i]["ue_up"] = list(to_ue_dir(up, axis_mapping))
 
 
-def smooth_extreme_spikes(
-    samples: List[Dict],
-    axis_mapping: str,
-    angle_threshold_deg: float = 70.0,
-    deviation_multiplier: float = 0.25,
-    max_passes: int = 5,
-) -> int:
-    if len(samples) < 5:
-        return 0
-
-    total_changes = 0
-    cos_threshold = math.cos(math.radians(angle_threshold_deg))
-
-    for _ in range(max(1, int(max_passes))):
-        seg_lengths = []
-        for i in range(1, len(samples)):
-            a = tuple(samples[i - 1]["pos_m"])
-            b = tuple(samples[i]["pos_m"])
-            seg_lengths.append(v_len(v_sub(b, a)))
-        avg_seg = max(sum(seg_lengths) / max(len(seg_lengths), 1), 1e-6)
-
-        pass_changes = 0
-        for i in range(1, len(samples) - 1):
-            p_prev = tuple(samples[i - 1]["pos_m"])
-            p_curr = tuple(samples[i]["pos_m"])
-            p_next = tuple(samples[i + 1]["pos_m"])
-
-            v_in = v_sub(p_curr, p_prev)
-            v_out = v_sub(p_next, p_curr)
-            d_in = v_len(v_in)
-            d_out = v_len(v_out)
-            if d_in < 1e-6 or d_out < 1e-6:
-                continue
-
-            u_in = v_norm(v_in)
-            u_out = v_norm(v_out)
-            turn_dot = dot(u_in, u_out)
-            if turn_dot > cos_threshold:
-                continue
-
-            # Needle-kink guard: if one leg is tiny and the local direction
-            # flips, smooth it even if perpendicular deviation is small.
-            short_leg = min(d_in, d_out)
-            long_leg = max(d_in, d_out)
-            force_micro_fix = (
-                long_leg > 1e-6
-                and short_leg / long_leg < 0.2
-                and turn_dot < -0.6
-            )
-
-            span = v_sub(p_next, p_prev)
-            span_len2 = dot(span, span)
-            if span_len2 < 1e-8:
-                continue
-
-            rel = v_sub(p_curr, p_prev)
-            t = max(0.0, min(1.0, dot(rel, span) / span_len2))
-            proj = v_add(p_prev, v_mul(span, t))
-            deviation = v_len(v_sub(p_curr, proj))
-            if (not force_micro_fix) and deviation < avg_seg * max(deviation_multiplier, 0.05):
-                continue
-
-            blend = d_in / (d_in + d_out)
-            replacement = v_lerp(p_prev, p_next, blend)
-            samples[i]["pos_m"] = [replacement[0], replacement[1], replacement[2]]
-            pass_changes += 1
-
-        if pass_changes == 0:
-            break
-        total_changes += pass_changes
-
-    # Secondary pass: remove short detour-loops where the path doubles back and
-    # returns to nearly the same flow direction over a small neighborhood.
-    window = 8
-    i = window + 2
-    while i < len(samples) - window - 2:
-        a = i - window
-        b = i + window
-
-        p_a = tuple(samples[a]["pos_m"])
-        p_b = tuple(samples[b]["pos_m"])
-
-        path_len = 0.0
-        for k in range(a + 1, b + 1):
-            path_len += v_len(v_sub(tuple(samples[k]["pos_m"]), tuple(samples[k - 1]["pos_m"])))
-        chord_len = v_len(v_sub(p_b, p_a))
-        if path_len < 1e-6 or chord_len < 1e-6:
-            i += 1
-            continue
-
-        ratio = chord_len / path_len
-        if ratio > 0.45:
-            i += 1
-            continue
-
-        dir_in = v_norm(v_sub(tuple(samples[a]["pos_m"]), tuple(samples[a - 2]["pos_m"])))
-        dir_out = v_norm(v_sub(tuple(samples[b + 2]["pos_m"]), tuple(samples[b]["pos_m"])))
-        if dot(dir_in, dir_out) < 0.5:
-            i += 1
-            continue
-
-        # Replace detour with smooth interpolation between neighborhood endpoints.
-        for k in range(a + 1, b):
-            t = (k - a) / float(b - a)
-            rep = v_lerp(p_a, p_b, t)
-            samples[k]["pos_m"] = [rep[0], rep[1], rep[2]]
-            total_changes += 1
-
-        i = b + 1
-
-    # Tertiary pass: detect short non-local self-returns (double-back detours).
-    # This catches smooth protrusions that bend out and come back near the same line.
-    if len(samples) > 64:
-        pts = [tuple(s["pos_m"]) for s in samples]
-        seg = [0.0]
-        for k in range(1, len(pts)):
-            seg.append(v_len(v_sub(pts[k], pts[k - 1])))
-        avg_seg = max(sum(seg[1:]) / max(len(seg) - 1, 1), 1e-6)
-
-        cum = [0.0] * len(pts)
-        for k in range(1, len(pts)):
-            cum[k] = cum[k - 1] + seg[k]
-
-        best = None
-        for a in range(12, len(pts) - 48):
-            max_b = min(len(pts) - 12, a + 120)
-            for b in range(a + 24, max_b):
-                chord = v_len(v_sub(pts[b], pts[a]))
-                arc = cum[b] - cum[a]
-                if arc < avg_seg * 60.0:
-                    continue
-                if chord > avg_seg * 8.0 or chord < 1e-6:
-                    continue
-
-                detour_ratio = arc / chord
-                if detour_ratio < 7.5:
-                    continue
-
-                dir_in = v_norm(v_sub(pts[a], pts[a - 2]))
-                dir_out = v_norm(v_sub(pts[b + 2], pts[b])) if (b + 2) < len(pts) else v_norm(v_sub(pts[b], pts[b - 2]))
-                if dot(dir_in, dir_out) < 0.35:
-                    continue
-
-                if best is None or detour_ratio > best[0]:
-                    best = (detour_ratio, a, b)
-
-        if best is not None:
-            _, a, b = best
-            p_a = pts[a]
-            p_b = pts[b]
-            for k in range(a + 1, b):
-                t = (k - a) / float(b - a)
-                rep = v_lerp(p_a, p_b, t)
-                samples[k]["pos_m"] = [rep[0], rep[1], rep[2]]
-                total_changes += 1
-
-    # Final pass: collapse needle-like micro segments that can produce visible
-    # protrusions in generated fallback rail geometry.
-    if len(samples) >= 3:
-        seg_lengths = []
-        for i in range(1, len(samples)):
-            a = tuple(samples[i - 1]["pos_m"])
-            b = tuple(samples[i]["pos_m"])
-            seg_lengths.append(v_len(v_sub(b, a)))
-        avg_seg = max(sum(seg_lengths) / max(len(seg_lengths), 1), 1e-6)
-
-        tiny_abs = avg_seg * 0.03
-        for i in range(1, len(samples) - 1):
-            p_prev = tuple(samples[i - 1]["pos_m"])
-            p_curr = tuple(samples[i]["pos_m"])
-            p_next = tuple(samples[i + 1]["pos_m"])
-
-            d_in = v_len(v_sub(p_curr, p_prev))
-            d_out = v_len(v_sub(p_next, p_curr))
-            short_leg = min(d_in, d_out)
-            long_leg = max(d_in, d_out)
-
-            # Strongly asymmetric local spacing is almost always a sampling glitch.
-            if short_leg < tiny_abs and long_leg > avg_seg * 0.25:
-                rep = v_lerp(p_prev, p_next, 0.5)
-                samples[i]["pos_m"] = [rep[0], rep[1], rep[2]]
-                total_changes += 1
-            elif long_leg > 1e-6 and short_leg / long_leg < 0.04 and short_leg < avg_seg * 0.08:
-                rep = v_lerp(p_prev, p_next, d_in / (d_in + d_out + 1e-12))
-                samples[i]["pos_m"] = [rep[0], rep[1], rep[2]]
-                total_changes += 1
-
-    if total_changes > 0:
-        recompute_samples_orientation(samples, axis_mapping)
-    return total_changes
-
-
 def segment_endpoints(elem: NLElemData, index: int):
     """Return (p0, kp1, kp2, p3) for segment `index`, matching build_sampled_path."""
     node = elem.nodes[index]
@@ -1067,13 +875,333 @@ def cumulative_arclength(samples) -> List[float]:
     return cum
 
 
+# ---------------------------------------------------------------------------
+# Outlier rejection and smoothing
+#
+# One automatic outlier pass plus one smoothing control replace what used to be
+# eight separate thresholds (four spike-filter knobs, two curvature knobs and
+# two source-defect ratios).
+#
+# The limits below are deliberately NOT settings. They describe geometry that
+# no roller coaster can have, so there is no ride for which a different value
+# is the right answer.
+#
+# Radius is the primary test, and the only one independent of how far apart the
+# stations sit: real track bottoms out around a 3m radius in the tightest
+# inversions, so a bend under a metre is a data error at any sampling density.
+#
+# The turn-angle test is a backstop for gross doubling-back, which the radius
+# test misses when a point is thrown far enough to sit on a wide arc. It has to
+# be generous, because turn angle per station scales with station spacing: at
+# the 0.5m spacing of a resolved CSV export, 45 degrees implies a 0.65m radius
+# the radius test already rejects, but at the 3.4m spacing of a reconstructed
+# Bezier path the same 45 degrees implies a 4.4m radius - an ordinary tight
+# helix. Set to 45 it deleted 73 of 363 legitimate stations on that path. Only
+# a reversal is impossible regardless of spacing.
+# ---------------------------------------------------------------------------
+
+IMPOSSIBLE_RADIUS_M = 1.0
+
+# Element-level defect flags, for the Bezier formats that expose control
+# points. These only mark forces as suspect in the output; they never edit
+# geometry, which is why they are fixed rather than exposed.
+TANGENT_BREAK_THRESHOLD_DEG = 5.0
+SEGMENT_DISTORTION_RATIO = 1.25
+IMPOSSIBLE_TURN_DEG = 120.0
+
+# Station spacing this far from the median is a gap in the export or a
+# duplicated point rather than a design choice.
+SPACING_OUTLIER_HIGH = 8.0
+SPACING_OUTLIER_LOW = 0.125
+
+# Removal is iterative because one bad station can mask the next.
+OUTLIER_MAX_PASSES = 8
+
+# Smoothing slider range. 0 measures at the path's own resolution; 100 averages
+# over 6m of track, which flattens everything short of a whole hill.
+SMOOTHING_DEFAULT = 15
+SMOOTHING_MAX_BASELINE_M = 6.0
+
+
+def median_spacing(samples: List[Dict]) -> float:
+    """Median distance between neighbouring stations."""
+    if len(samples) < 2:
+        return 0.0
+    gaps = sorted(
+        v_len(v_sub(tuple(samples[i]["pos_m"]), tuple(samples[i - 1]["pos_m"])))
+        for i in range(1, len(samples))
+    )
+    return gaps[len(gaps) // 2]
+
+
+def smoothing_baseline_m(smoothing: float, spacing_m: float) -> float:
+    """Curvature measurement baseline in metres for a 0-100 smoothing setting.
+
+    Curvature is measured across a real distance rather than between adjacent
+    samples, and this is that distance. It is the only thing the smoothing
+    slider changes, which is what makes one slider enough: every visible
+    consequence of smoothing - how sharp a transition reads, how high the peak
+    G climbs - follows from how far apart the three measurement points sit.
+
+    The floor is tied to sample spacing because measuring across less than a
+    couple of samples reads quantisation noise, not track. The curve is
+    quadratic so the low end, where the useful settings live, has fine control.
+    """
+    s = max(0.0, min(100.0, float(smoothing))) / 100.0
+    floor = max(2.5 * spacing_m, 0.05)
+    top = max(SMOOTHING_MAX_BASELINE_M, floor)
+    return floor + (top - floor) * s * s
+
+
+def _three_point_curvature(p_a, p_b, p_c) -> float:
+    """Menger (circumcircle) curvature of three points, kappa = 4*Area/(a*b*c)."""
+    side_a = v_len(v_sub(p_b, p_a))
+    side_b = v_len(v_sub(p_c, p_b))
+    side_c = v_len(v_sub(p_c, p_a))
+    if side_a < 1e-9 or side_b < 1e-9 or side_c < 1e-9:
+        return 0.0
+    area = 0.5 * v_len(cross(v_sub(p_b, p_a), v_sub(p_c, p_a)))
+    return 4.0 * area / (side_a * side_b * side_c)
+
+
+def _turn_angle_deg(p_prev, p_curr, p_next) -> float:
+    """Direction change at p_curr, in degrees."""
+    v_in = v_sub(p_curr, p_prev)
+    v_out = v_sub(p_next, p_curr)
+    if v_len(v_in) < 1e-9 or v_len(v_out) < 1e-9:
+        return 0.0
+    c = dot(v_norm(v_in), v_norm(v_out))
+    return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+
+
+def reject_outliers(samples: List[Dict], axis_mapping: str) -> Tuple[List[Dict], Dict]:
+    """Drop stations that cannot be real track, and report what went.
+
+    This is the single outlier pass. It replaces the old five-stage spike
+    filter, whose stages rewrote position by straight-lining whole
+    neighbourhoods - which is why detail went missing: a legitimate tight
+    helix has a low chord-to-arc ratio too, so the filter flattened real
+    geometry along with the artifacts, and the curvature baseline then had to
+    be widened to hide the kinks that flattening left behind.
+
+    Deleting a bad station and letting the interpolation bridge the hole is
+    both gentler and more honest: good geometry either side is untouched, and
+    the smooth resample reconstructs the span from its neighbours instead of
+    replacing it with a straight line.
+
+    Returns the surviving samples and a report. Gaps are reported but never
+    "fixed": missing track cannot be invented, and quietly bridging it would
+    turn an export bug into a plausible-looking ride.
+    """
+    report = {
+        "input_count": len(samples),
+        "removed_non_finite": 0,
+        "removed_duplicate": 0,
+        "removed_impossible_kink": 0,
+        "removed_spacing_outlier": 0,
+        "worst_kept_curvature_1pm": 0.0,
+        "worst_removed": [],
+        "gaps": [],
+    }
+    if len(samples) < 3:
+        report["output_count"] = len(samples)
+        return samples, report
+
+    work = list(samples)
+
+    # ---- non-finite and duplicate positions -------------------------------
+    cleaned: List[Dict] = []
+    for s in work:
+        pos = tuple(float(v) for v in s["pos_m"])
+        if not all(math.isfinite(v) for v in pos):
+            report["removed_non_finite"] += 1
+            continue
+        if cleaned and v_len(v_sub(pos, tuple(cleaned[-1]["pos_m"]))) < 1e-7:
+            report["removed_duplicate"] += 1
+            continue
+        cleaned.append(s)
+    work = cleaned
+
+    # ---- impossible kinks -------------------------------------------------
+    # A station is dropped when it is both physically impossible AND removing
+    # it makes the path straighter. The second condition matters: at a genuine
+    # gap the geometry looks kinked from either side, and deleting good
+    # stations around a gap would eat real track.
+    max_kappa = 1.0 / IMPOSSIBLE_RADIUS_M
+    for _ in range(OUTLIER_MAX_PASSES):
+        if len(work) < 5:
+            break
+
+        flagged = []
+        for i in range(1, len(work) - 1):
+            p_prev = tuple(work[i - 1]["pos_m"])
+            p_curr = tuple(work[i]["pos_m"])
+            p_next = tuple(work[i + 1]["pos_m"])
+            kappa = _three_point_curvature(p_prev, p_curr, p_next)
+            turn = _turn_angle_deg(p_prev, p_curr, p_next)
+            if kappa > max_kappa or turn > IMPOSSIBLE_TURN_DEG:
+                flagged.append((i, kappa, turn))
+
+        if not flagged:
+            break
+
+        # One station out of place makes its NEIGHBOURS look kinked too, so a
+        # left-to-right sweep removes a neighbour and leaves the culprit
+        # sitting there - which is how a single bad point used to cost eleven
+        # good ones and open a hole wide enough to ring like a plucked string.
+        # Taking only the sharpest station in each contiguous run of flags
+        # removes the offender itself, and the next pass re-checks what is
+        # left. Deleting less is the whole point of doing this per-station
+        # instead of straight-lining a window.
+        victims = set()
+        run = [flagged[0]]
+        for entry in list(flagged[1:]) + [None]:
+            if entry is not None and entry[0] == run[-1][0] + 1:
+                run.append(entry)
+                continue
+            worst_i, worst_k, worst_turn = max(run, key=lambda e: e[2])
+            victims.add(worst_i)
+            report["worst_removed"].append(
+                {
+                    "index": int(work[worst_i].get("index", worst_i)),
+                    "curvature_1pm": worst_k,
+                    "radius_m": (1.0 / worst_k) if worst_k > 1e-9 else float("inf"),
+                    "turn_deg": worst_turn,
+                }
+            )
+            run = [entry] if entry is not None else []
+
+        report["removed_impossible_kink"] += len(victims)
+        work = [s for j, s in enumerate(work) if j not in victims]
+
+    # ---- spacing outliers -------------------------------------------------
+    spacing = median_spacing(work)
+    if spacing > 0.0 and len(work) >= 3:
+        low = spacing * SPACING_OUTLIER_LOW
+        high = spacing * SPACING_OUTLIER_HIGH
+
+        # Needle-short steps are duplicated points that survived the exact
+        # duplicate test; drop them.
+        keep = [work[0]]
+        for i in range(1, len(work) - 1):
+            step = v_len(v_sub(tuple(work[i]["pos_m"]), tuple(keep[-1]["pos_m"])))
+            if step < low:
+                report["removed_spacing_outlier"] += 1
+                continue
+            keep.append(work[i])
+        keep.append(work[-1])
+        work = keep
+
+        # Oversized steps are missing track. Reported, never bridged.
+        for i in range(1, len(work)):
+            step = v_len(v_sub(tuple(work[i]["pos_m"]), tuple(work[i - 1]["pos_m"])))
+            if step > high:
+                report["gaps"].append(
+                    {
+                        "index": int(work[i].get("index", i)),
+                        "gap_m": step,
+                        "ratio": step / spacing,
+                        "median_spacing_m": spacing,
+                    }
+                )
+
+    for i in range(1, len(work) - 1):
+        report["worst_kept_curvature_1pm"] = max(
+            report["worst_kept_curvature_1pm"],
+            _three_point_curvature(
+                tuple(work[i - 1]["pos_m"]),
+                tuple(work[i]["pos_m"]),
+                tuple(work[i + 1]["pos_m"]),
+            ),
+        )
+
+    report["removed_total"] = (
+        report["removed_non_finite"]
+        + report["removed_duplicate"]
+        + report["removed_impossible_kink"]
+        + report["removed_spacing_outlier"]
+    )
+    report["output_count"] = len(work)
+
+    if report["removed_total"] > 0:
+        for j, s in enumerate(work):
+            s["index"] = j
+        recompute_samples_orientation(work, axis_mapping)
+
+    return work, report
+
+
+def report_outliers(report: Dict) -> None:
+    """Print the outlier pass in the same voice as the rest of the converter."""
+    removed = report.get("removed_total", 0)
+    kept_kappa = report.get("worst_kept_curvature_1pm", 0.0)
+    radius = (1.0 / kept_kappa) if kept_kappa > 1e-9 else float("inf")
+
+    if removed == 0:
+        print(
+            f"Outlier check: nothing removed from {report['input_count']} stations "
+            f"(tightest radius {radius:.2f}m)"
+        )
+    else:
+        parts = []
+        for key, label in (
+            ("removed_impossible_kink", "impossible kink"),
+            ("removed_spacing_outlier", "spacing outlier"),
+            ("removed_duplicate", "duplicate"),
+            ("removed_non_finite", "non-finite"),
+        ):
+            if report.get(key):
+                parts.append(f"{report[key]} {label}")
+        print(
+            f"Outlier check: removed {removed} of {report['input_count']} stations "
+            f"({', '.join(parts)}); tightest surviving radius {radius:.2f}m"
+        )
+        for bad in report.get("worst_removed", [])[:6]:
+            print(
+                f"  station {bad['index']:5d}: radius {bad['radius_m']:.3f}m, "
+                f"turn {bad['turn_deg']:.1f}deg - removed"
+            )
+
+    for gap in report.get("gaps", [])[:6]:
+        print(
+            f"  station {gap['index']:5d}: {gap['gap_m']:.2f}m gap "
+            f"({gap['ratio']:.1f}x median {gap['median_spacing_m']:.2f}m) - "
+            "MISSING TRACK in the export, left as-is"
+        )
+
+
+def _hermite(p0, p1, t0, t1, length, t):
+    """Cubic Hermite point at t, with unit tangents scaled by segment length."""
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+    return (
+        p0[0] * h00 + t0[0] * length * h10 + p1[0] * h01 + t1[0] * length * h11,
+        p0[1] * h00 + t0[1] * length * h10 + p1[1] * h01 + t1[1] * length * h11,
+        p0[2] * h00 + t0[2] * length * h10 + p1[2] * h01 + t1[2] * length * h11,
+    )
+
+
 def resample_uniform_arclength(samples: List[Dict], spacing_m: float, axis_mapping: str) -> List[Dict]:
-    """Re-space samples evenly along the path.
+    """Re-space samples evenly along the path, following the curve.
 
     build_sampled_path steps each Bezier in uniform parameter t, which produces
     spacing that varies by an order of magnitude with |P'(t)|. Finite-difference
-    curvature over unevenly spaced points is biased by the spacing itself, so the
-    stations are levelled out before anything is differentiated.
+    curvature over unevenly spaced points is biased by the spacing itself, so
+    the stations are levelled out before anything is differentiated.
+
+    The interpolation is a cubic Hermite through each pair of stations using the
+    tangents they already carry, NOT a straight line between them. That
+    distinction is the whole ball game. Linear interpolation turns a smooth
+    curve into a polyline: every interpolated point sits exactly on a chord, so
+    a fifth of the path reads as dead straight and all of the real curvature
+    piles up into kinks at the original stations. Curvature then had to be
+    averaged over metres of track to look sane, and averaging over metres is
+    what flattened the drops. Hermite reproduces the curve the stations came
+    from, so curvature can be measured close-in and the detail survives.
     """
     if spacing_m <= 0.0 or len(samples) < 3:
         return samples
@@ -1095,7 +1223,18 @@ def resample_uniform_arclength(samples: List[Dict], spacing_m: float, axis_mappi
         t = 0.0 if seg < 1e-12 else (target - cum[src]) / seg
 
         a, b = samples[src], samples[src + 1]
-        pos = v_lerp(tuple(a["pos_m"]), tuple(b["pos_m"]), t)
+        p0 = tuple(float(v) for v in a["pos_m"])
+        p1 = tuple(float(v) for v in b["pos_m"])
+        t0 = tuple(float(v) for v in a["tan"])
+        t1 = tuple(float(v) for v in b["tan"])
+
+        # Fall back to the chord if a station has no usable tangent, which is
+        # better than emitting a NaN into the physics path.
+        if v_len(t0) < 1e-6 or v_len(t1) < 1e-6:
+            pos = v_lerp(p0, p1, t)
+        else:
+            chord = v_len(v_sub(p1, p0))
+            pos = _hermite(p0, p1, v_norm(t0), v_norm(t1), chord, t)
 
         # Roll is a scalar angle along the path, so it interpolates directly.
         # Orientation frames are rebuilt from position and roll afterwards.
@@ -1257,9 +1396,17 @@ def simulate_gravity_timeline(
     error in the ride's timing.
 
     So: while the track is climbing and free-rolling would be slower than the
-    lift, the train is on the lift and holds lift_speed exactly. Everywhere else
-    it rolls. min_speed stays only as a numerical floor for the flat, undriven
+    lift, the train is on the lift and holds lift_speed. Everywhere else it
+    rolls. min_speed stays only as a numerical floor for the flat, undriven
     stretches.
+
+    Speed is solved for the whole path before time is integrated, so that
+    acceleration is differentiated from a finished speed profile rather than
+    accumulated step by step.
+
+    The moment the chain takes the load is a genuine discontinuity in
+    longitudinal acceleration, on a real ride as much as in this model, and it
+    is left as one. It is reported by the jolt check rather than smoothed away.
     """
     if not samples:
         return []
@@ -1267,37 +1414,25 @@ def simulate_gravity_timeline(
     if curvature is None:
         curvature = [0.0] * len(samples)
 
-    timeline = []
-    t_acc = 0.0
-    s_acc = 0.0
-    v_prev = max(initial_speed, min_speed)
+    n = len(samples)
+    steps = [0.0] * n           # arc length of the step ending at i
+    speed = [0.0] * n
+    on_lift = [False] * n
+    speed[0] = max(initial_speed, min_speed)
 
-    first = dict(samples[0])
-    first.update(
-        {
-            "time_s": 0.0,
-            "distance_m": 0.0,
-            "speed_mps": v_prev,
-            "curvature_1pm": curvature[0],
-            "normal_acc_mps2": v_prev * v_prev * curvature[0],
-            "tangential_acc_mps2": 0.0,
-            "lift_driven": False,
-        }
-    )
-    timeline.append(first)
-
-    for i in range(1, len(samples)):
+    # ---- pass 1: free-rolling speed with a hard lift clamp ----------------
+    for i in range(1, n):
         p0 = tuple(samples[i - 1]["pos_m"])
         p1 = tuple(samples[i]["pos_m"])
         ds = max(v_len(v_sub(p1, p0)), 1e-6)
-        s_acc += ds
+        steps[i] = ds
 
         # Height is source Y (NoLimits/FVD convention). This is deliberately
         # independent of --axis-mapping: gravity acts along the source vertical
         # regardless of which Unreal axis that later becomes.
         dh = p0[1] - p1[1]
 
-        # Energy update with simple rolling+drag losses.
+        v_prev = speed[i - 1]
         v_sq = (
             v_prev * v_prev
             + 2.0 * g * dh
@@ -1308,34 +1443,135 @@ def simulate_gravity_timeline(
 
         # dh is the drop over this step, so dh < 0 means the track is climbing.
         climbing = dh < 0.0
-        on_lift = lift_speed > 0.0 and climbing and v_free < lift_speed
-        if on_lift:
-            v_cur = lift_speed
-        else:
-            v_cur = max(v_free, min_speed)
+        driven = lift_speed > 0.0 and climbing and v_free < lift_speed
+        on_lift[i] = driven
+        speed[i] = lift_speed if driven else max(v_free, min_speed)
+
+    # ---- pass 2: integrate time and differentiate ------------------------
+    timeline = []
+    first_row = dict(samples[0])
+    first_row.update(
+        {
+            "time_s": 0.0,
+            "distance_m": 0.0,
+            "speed_mps": speed[0],
+            "curvature_1pm": curvature[0],
+            "normal_acc_mps2": speed[0] * speed[0] * curvature[0],
+            "tangential_acc_mps2": 0.0,
+            "lift_driven": False,
+        }
+    )
+    timeline.append(first_row)
+
+    t_acc = 0.0
+    s_acc = 0.0
+    for i in range(1, n):
+        ds = steps[i]
+        s_acc += ds
+        v_cur = speed[i]
+        v_prev = speed[i - 1]
 
         v_avg = max(0.5 * (v_prev + v_cur), min_speed)
-        dt = ds / v_avg
-        t_acc += dt
+        t_acc += ds / v_avg
 
-        k = curvature[i]
         row = dict(samples[i])
         row.update(
             {
                 "time_s": t_acc,
                 "distance_m": s_acc,
                 "speed_mps": v_cur,
-                "curvature_1pm": k,
-                "normal_acc_mps2": v_cur * v_cur * k,
+                "curvature_1pm": curvature[i],
+                "normal_acc_mps2": v_cur * v_cur * curvature[i],
                 # Longitudinal acceleration: what a rider feels as launch/brake.
                 "tangential_acc_mps2": (v_cur * v_cur - v_prev * v_prev) / (2.0 * ds),
-                "lift_driven": on_lift,
+                "lift_driven": on_lift[i],
             }
         )
         timeline.append(row)
-        v_prev = v_cur
 
     return timeline
+
+
+# Longitudinal jerk a rider would call a jolt. Comfort research puts the
+# noticeable threshold around 20-40 m/s3; this sits just above it so that
+# ordinary transitions do not cry wolf.
+JOLT_JERK_LIMIT_MPS3 = 50.0
+
+
+def find_jolts(timeline: List[Dict]) -> List[Dict]:
+    """Locate longitudinal jerk spikes that will read as a jolt in Unreal.
+
+    Geometry-driven jolts are already gone by this point - the outlier pass
+    deletes the stations that cause them. What survives is either a real
+    feature of the ride or a boundary in the physics model, so this reports
+    rather than edits, and says which of the two it thinks it found.
+    """
+    runs: List[Dict] = []
+    current = None
+
+    for i in range(1, len(timeline)):
+        dt = timeline[i]["time_s"] - timeline[i - 1]["time_s"]
+        if dt <= 1e-9:
+            continue
+        jerk = abs(
+            timeline[i]["tangential_acc_mps2"]
+            - timeline[i - 1]["tangential_acc_mps2"]
+        ) / dt
+
+        if jerk < JOLT_JERK_LIMIT_MPS3:
+            if current is not None:
+                runs.append(current)
+                current = None
+            continue
+
+        lift_edge = bool(timeline[i].get("lift_driven")) != bool(
+            timeline[i - 1].get("lift_driven")
+        )
+        if current is None:
+            current = {
+                "start_index": i,
+                "end_index": i,
+                "peak_jerk_mps3": jerk,
+                "distance_m": timeline[i]["distance_m"],
+                "speed_mps": timeline[i]["speed_mps"],
+                "cause": "lift engagement" if lift_edge else "track geometry",
+            }
+        else:
+            current["end_index"] = i
+            if jerk > current["peak_jerk_mps3"]:
+                current["peak_jerk_mps3"] = jerk
+            if lift_edge:
+                current["cause"] = "lift engagement"
+
+    if current is not None:
+        runs.append(current)
+
+    runs.sort(key=lambda r: -r["peak_jerk_mps3"])
+    return runs
+
+
+def report_jolts(jolts: List[Dict]) -> None:
+    if not jolts:
+        print(
+            f"Jolt check: no longitudinal jerk above {JOLT_JERK_LIMIT_MPS3:.0f} m/s3"
+        )
+        return
+
+    geometry = [j for j in jolts if j["cause"] == "track geometry"]
+    print(
+        f"Jolt check: {len(jolts)} spike(s) above {JOLT_JERK_LIMIT_MPS3:.0f} m/s3 "
+        f"({len(geometry)} from track geometry)"
+    )
+    for j in jolts[:6]:
+        print(
+            f"  {j['distance_m']:7.1f}m at {j['speed_mps']:5.1f} m/s: "
+            f"{j['peak_jerk_mps3']:7.0f} m/s3 - {j['cause']}"
+        )
+    if geometry:
+        print(
+            "  Geometry jolts that survive the outlier pass are real features "
+            "of the source track, not artifacts."
+        )
 
 
 def write_csv_timeline(path: Path, timeline: List[Dict]) -> None:
@@ -1660,35 +1896,16 @@ def main() -> None:
              "differentiating. 0 disables it and keeps uniform-in-t spacing.",
     )
     parser.add_argument(
-        "--segment-distortion-ratio",
-        type=float,
-        default=1.25,
-        help="Control-polygon length over chord length above which a segment is "
-             "treated as containing a cusp or loop and its forces flagged.",
-    )
-    parser.add_argument(
-        "--tangent-break-threshold-deg",
-        type=float,
-        default=5.0,
-        help="Corner angle between consecutive Bezier segments above which the "
-             "path is treated as non-differentiable and its forces flagged.",
-    )
-    parser.add_argument(
-        "--curvature-window-s",
-        type=float,
-        default=0.15,
-        help="Time window the curvature measurement spans, matching "
-             "CoasterAnalyzer's differentiation window. The baseline becomes "
-             "speed * window, so both measure the same physical scale. "
-             "0 uses a fixed --curvature-baseline-m instead.",
-    )
-    parser.add_argument(
-        "--curvature-baseline-m",
-        type=float,
-        default=1.0,
-        help="Minimum curvature baseline in metres. Acts as a floor for the "
-             "speed-scaled window so slow sections are not measured over a "
-             "near-zero distance.",
+        "--smoothing",
+        type=int,
+        default=SMOOTHING_DEFAULT,
+        metavar="0-100",
+        help="How much the force readings are smoothed, 0-100. This is the only "
+             "smoothing control. It sets the distance curvature is measured "
+             "across: 0 measures at the path's own resolution and keeps every "
+             "transition sharp, 100 averages over several metres of track and "
+             "flattens everything short of a whole hill. Outlier removal is "
+             "automatic and not affected by this.",
     )
     parser.add_argument(
         "--axis-mapping",
@@ -1859,10 +2076,6 @@ def main() -> None:
         "--drag-coeff", type=float, default=0.0004,
         help="Air drag coefficient, per metre of speed squared.",
     )
-    parser.add_argument("--disable-spike-filter", action="store_true")
-    parser.add_argument("--spike-angle-threshold-deg", type=float, default=70.0)
-    parser.add_argument("--spike-deviation-multiplier", type=float, default=0.25)
-    parser.add_argument("--spike-max-passes", type=int, default=5)
 
     args = parser.parse_args()
 
@@ -1970,11 +2183,16 @@ def main() -> None:
             initial_roll=spline.nodes[0].roll if spline.nodes else 0.0,
         )
 
-    # The spike filter rewrites sample positions. Every position edit changes
-    # local curvature, and curvature is what the forces are derived from: a
-    # straight-line replacement reads as kappa=0 (phantom airtime) bracketed by
-    # C1 kinks (phantom spikes). So it runs on a copy used only for building
-    # render geometry, and the analytic path stays exactly as sampled.
+    # Outlier removal runs first, on the source stations, and its result feeds
+    # BOTH the physics timeline and the render geometry. The old spike filter
+    # ran on a render-only copy precisely because it was too destructive to let
+    # near the forces - it straight-lined whole neighbourhoods. Deleting only
+    # the handful of stations that cannot be track is safe enough to share, so
+    # the geometry Unreal draws and the geometry the forces come from are once
+    # again the same path.
+    sampled, outlier_report = reject_outliers(sampled, args.axis_mapping)
+    report_outliers(outlier_report)
+
     raw_sample_count = len(sampled)
     sampled = resample_uniform_arclength(
         sampled, args.resample_spacing_m, args.axis_mapping
@@ -1982,19 +2200,11 @@ def main() -> None:
     if len(sampled) != raw_sample_count:
         print(
             f"Resampled analytic path: {raw_sample_count} -> {len(sampled)} "
-            f"points at {args.resample_spacing_m * 100:.1f}cm spacing"
+            f"points at {args.resample_spacing_m * 100:.1f}cm spacing, "
+            "following the curve"
         )
 
     render_samples = copy.deepcopy(sampled)
-    spike_edits = 0
-    if not args.disable_spike_filter:
-        spike_edits = smooth_extreme_spikes(
-            render_samples,
-            axis_mapping=args.axis_mapping,
-            angle_threshold_deg=args.spike_angle_threshold_deg,
-            deviation_multiplier=args.spike_deviation_multiplier,
-            max_passes=args.spike_max_passes,
-        )
 
     validation = None
     if args.validate_reference_csv:
@@ -2024,8 +2234,8 @@ def main() -> None:
 
     if spline is not None:
         gaps = detect_source_gaps(spline)
-        breaks = detect_tangent_breaks(spline, args.tangent_break_threshold_deg)
-        malformed = detect_malformed_segments(spline, args.segment_distortion_ratio)
+        breaks = detect_tangent_breaks(spline, TANGENT_BREAK_THRESHOLD_DEG)
+        malformed = detect_malformed_segments(spline, SEGMENT_DISTORTION_RATIO)
     else:
         # A resolved export has no control points to inspect, so spacing is the
         # only defect signal available.
@@ -2081,7 +2291,7 @@ def main() -> None:
         print("")
         print(
             f"--- tangent discontinuities: {len(breaks)} node boundaries exceed "
-            f"{args.tangent_break_threshold_deg:.1f} deg ---"
+            f"{TANGENT_BREAK_THRESHOLD_DEG:.1f} deg ---"
         )
         for b in worst[:8]:
             print(
@@ -2112,24 +2322,24 @@ def main() -> None:
             curvature=curv,
         )
 
-    if args.curvature_window_s > 0.0:
-        speeds = [row["speed_mps"] for row in run_timeline(None)]
-        # An accelerometer, and CoasterAnalyzer, filter over a time window. The
-        # distance that window covers depends on how fast the car is moving, so
-        # matching it means a baseline of v*window rather than a fixed length.
-        baselines = [v * args.curvature_window_s for v in speeds]
-        curvature = compute_curvature(
-            sampled, baselines, min_baseline_m=args.curvature_baseline_m
-        )
-        print(
-            f"Curvature baseline: {args.curvature_window_s:.3f}s of travel "
-            f"({min(baselines):.2f}-{max(baselines):.2f}m, floor "
-            f"{args.curvature_baseline_m:.2f}m)"
-        )
-    else:
-        curvature = compute_curvature(sampled, args.curvature_baseline_m)
+    # One baseline, from one slider, applied uniformly along the track.
+    #
+    # This used to scale with local speed, on the reasoning that an
+    # accelerometer filters over a time window. The effect was that the fastest
+    # parts of the ride - the drops, the only place peak G actually matters -
+    # got measured across four metres of track and read smoothest, while the
+    # slow crawl up the lift got measured across one metre and read sharpest.
+    # Exactly backwards. A fixed distance treats the whole ride alike.
+    smoothing_m = smoothing_baseline_m(args.smoothing, median_spacing(sampled))
+    curvature = compute_curvature(sampled, smoothing_m)
+    print(
+        f"Smoothing {args.smoothing}/100: curvature measured across "
+        f"{smoothing_m:.2f}m of track"
+    )
 
     timeline = run_timeline(curvature)
+    jolts = find_jolts(timeline)
+    report_jolts(jolts)
 
     suspect_segments = {g["node_index"] - 1 for g in gaps}
     for b in breaks:
@@ -2142,7 +2352,7 @@ def main() -> None:
     suspect_count = mark_suspect_samples(
         timeline,
         suspect_segments,
-        margin_m=max(args.curvature_baseline_m * 2.0, 2.0),
+        margin_m=max(smoothing_m * 2.0, 2.0),
     )
 
     bundle = {
@@ -2186,7 +2396,7 @@ def main() -> None:
             "gaps": gaps,
             "malformed_segments": malformed,
             "tangent_breaks": breaks,
-            "tangent_break_threshold_deg": args.tangent_break_threshold_deg,
+            "tangent_break_threshold_deg": TANGENT_BREAK_THRESHOLD_DEG,
             "suspect_sample_count": suspect_count,
             "suspect_sample_fraction": (
                 suspect_count / len(timeline) if timeline else 0.0
@@ -2214,8 +2424,8 @@ def main() -> None:
         },
         "physics": {
             "resample_spacing_m": args.resample_spacing_m,
-            "curvature_window_s": args.curvature_window_s,
-            "curvature_baseline_m": args.curvature_baseline_m,
+            "smoothing": args.smoothing,
+            "curvature_baseline_m": smoothing_m,
             "g": args.g,
             "initial_speed": args.initial_speed,
             "min_speed": args.min_speed,
@@ -2224,14 +2434,30 @@ def main() -> None:
             "drag_coeff": args.drag_coeff,
         },
         "cleanup": {
-            # Applies to "render_path" only. "samples" is never geometry-edited,
-            # so the physics timeline is derived from the path as sampled.
-            "applies_to": "render_path",
-            "spike_filter_enabled": not args.disable_spike_filter,
-            "spike_angle_threshold_deg": args.spike_angle_threshold_deg,
-            "spike_deviation_multiplier": args.spike_deviation_multiplier,
-            "spike_max_passes": args.spike_max_passes,
-            "spike_points_smoothed": spike_edits,
+            # Outlier removal now precedes the split, so both paths derive from
+            # the same stations. Nothing downstream is smoothing-corrected.
+            "applies_to": "all_paths",
+            "method": "outlier_rejection",
+            "stations_in": outlier_report["input_count"],
+            "stations_out": outlier_report["output_count"],
+            "removed_total": outlier_report["removed_total"],
+            "removed_impossible_kink": outlier_report["removed_impossible_kink"],
+            "removed_spacing_outlier": outlier_report["removed_spacing_outlier"],
+            "removed_duplicate": outlier_report["removed_duplicate"],
+            "removed_non_finite": outlier_report["removed_non_finite"],
+            "impossible_radius_m": IMPOSSIBLE_RADIUS_M,
+            "impossible_turn_deg": IMPOSSIBLE_TURN_DEG,
+            "tightest_surviving_radius_m": (
+                1.0 / outlier_report["worst_kept_curvature_1pm"]
+                if outlier_report["worst_kept_curvature_1pm"] > 1e-9
+                else None
+            ),
+            "gaps_reported": len(outlier_report["gaps"]),
+            "jolt_jerk_limit_mps3": JOLT_JERK_LIMIT_MPS3,
+            "jolts_flagged": len(jolts),
+            "jolts_from_geometry": sum(
+                1 for j in jolts if j["cause"] == "track geometry"
+            ),
         },
         "samples": timeline,
         # Carries orientation as well as position so Unreal can build the track
@@ -2463,8 +2689,6 @@ def main() -> None:
             "motion is still visible; set --car-mesh-asset or --car-mesh-file "
             "to use a real car."
         )
-    if not args.disable_spike_filter:
-        print(f"Spike smoothing edits (render path only): {spike_edits}")
 
     def pct(vals, q):
         if not vals:

@@ -25,19 +25,33 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SCRIPT_DIR))
 
 
-def _default_app_state_dir() -> Path:
+def _app_state_dir() -> Path:
+    """Per-user settings location, following each platform's convention.
+
+    Windows keeps its historical LOCALAPPDATA path so existing installs find
+    their saved settings; macOS and Linux use their own standard directories.
+    """
     if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support"
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "UE5_CoasterPipeline"
 
 
-APP_STATE_DIR = _default_app_state_dir() / "UE5_CoasterPipeline"
+APP_STATE_DIR = _app_state_dir()
 CONVERTER_SCRIPT = RESOURCE_DIR / "convert_nlelem_to_ue.py"
 STATE_FILE = APP_STATE_DIR / ".gui_state.json"
 
-CONFIG_VERSION = 7
+CONFIG_VERSION = 8
+
+# The one smoothing control. Mirrors SMOOTHING_DEFAULT in the converter.
+SMOOTHING_DEFAULT = 15
+
+# Single source of truth for the shipped version; the packaging scripts read it.
+APP_VERSION = "1.1.0"
+
 
 # LSU brand colours: Purple PMS 268 and Gold PMS 123.
 LSU_PURPLE = "#461D7C"
@@ -100,8 +114,12 @@ class PipelineConfig:
     lift_speed: float = 4.0
     rolling_friction: float = 0.004
     drag_coeff: float = 0.0004
-    curvature_window_s: float = 0.15
-    curvature_baseline_m: float = 1.0
+    # One slider, 0-100. Sets how far apart the three points used to measure
+    # track curvature sit, which is the only thing that decides how sharp the
+    # force readings come out. Replaces the two curvature knobs, the four
+    # spike-filter knobs and the two defect ratios that used to be spread
+    # across three tabs.
+    smoothing: int = SMOOTHING_DEFAULT
 
     # Coaster car. Presentation only: none of it affects the physics timeline.
     car_mesh_asset: str = ""
@@ -130,15 +148,10 @@ class PipelineConfig:
     samples_per_segment: int = 20
     resample_spacing_m: float = 0.10
 
-    # Render-path cleanup (does not affect the physics timeline)
-    spike_filter_enabled: bool = True
-    spike_angle_threshold_deg: float = 70.0
-    spike_deviation_multiplier: float = 0.25
-    spike_max_passes: int = 5
-
-    # Source-defect detection thresholds
-    segment_distortion_ratio: float = 1.25
-    tangent_break_threshold_deg: float = 5.0
+    # Outlier removal has no settings on purpose. It deletes only geometry
+    # that is physically impossible for track - kinks tighter than a metre,
+    # duplicate and non-finite points - and those limits are facts about
+    # coasters, not preferences.
 
     # Populated by migrate_state for logging. Excluded from the saved file.
     state_migrations: list = field(default_factory=list)
@@ -147,6 +160,16 @@ class PipelineConfig:
 # Settings that no longer exist. Kept only so a saved file that still contains
 # them can be reported and cleaned rather than silently carrying dead weight.
 REMOVED_KEYS = {
+    # Consolidated into the single "smoothing" slider plus automatic outlier
+    # removal in config version 8.
+    "curvature_window_s",
+    "curvature_baseline_m",
+    "spike_filter_enabled",
+    "spike_angle_threshold_deg",
+    "spike_deviation_multiplier",
+    "spike_max_passes",
+    "segment_distortion_ratio",
+    "tangent_break_threshold_deg",
     "mesh_3ds",
     "blender_exe",
     "cart_model_glb",
@@ -281,6 +304,25 @@ def migrate_state(cfg: PipelineConfig, data: dict) -> PipelineConfig:
         # so it is on by default even for configs saved before it existed.
         notes.append("car_export_glb: on (the .glb is what Unreal imports as animation)")
 
+    if from_version < 8:
+        # Eight thresholds became one slider plus automatic outlier removal.
+        # The slider deliberately starts at its new default rather than being
+        # fitted to the old settings: the old behaviour measured curvature
+        # across up to 4m of track on the fastest parts of the ride, and
+        # reproducing that would carry the flattened drops forward, which is
+        # the bug being fixed.
+        retired = sorted(REMOVED_KEYS & set(data))
+        if retired:
+            notes.append(
+                f"smoothing: {len(retired)} old smoothing and defect setting(s) "
+                f"replaced by one slider at {cfg.smoothing}/100; outlier "
+                "removal is now automatic and always on"
+            )
+            notes.append(
+                "drops and other fast sections will read sharper than before, "
+                "with higher peak G - that is the correction, not a new error"
+            )
+
     if from_version < CONFIG_VERSION:
         cfg.config_version = CONFIG_VERSION
 
@@ -328,10 +370,7 @@ def build_converter_command(
         "--lift-speed", str(cfg.lift_speed),
         "--rolling-friction", str(cfg.rolling_friction),
         "--drag-coeff", str(cfg.drag_coeff),
-        "--curvature-window-s", str(cfg.curvature_window_s),
-        "--curvature-baseline-m", str(cfg.curvature_baseline_m),
-        "--segment-distortion-ratio", str(cfg.segment_distortion_ratio),
-        "--tangent-break-threshold-deg", str(cfg.tangent_break_threshold_deg),
+        "--smoothing", str(int(cfg.smoothing)),
     ]
 
     if not cfg.car_export_fbx:
@@ -370,14 +409,6 @@ def build_converter_command(
     reference = cfg.validate_reference_csv.strip()
     if reference and Path(reference).exists():
         args.extend(["--validate-reference-csv", reference])
-
-    if not cfg.spike_filter_enabled:
-        args.append("--disable-spike-filter")
-    args.extend([
-        "--spike-angle-threshold-deg", str(cfg.spike_angle_threshold_deg),
-        "--spike-deviation-multiplier", str(cfg.spike_deviation_multiplier),
-        "--spike-max-passes", str(cfg.spike_max_passes),
-    ])
 
     if IS_FROZEN:
         return [str(sys.executable), "--internal-convert", *args]
@@ -590,11 +621,13 @@ def headless_smoke_test() -> int:
     return 0
 
 
-def launch_gui() -> None:
+def launch_gui(initial_input: str | None = None) -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     cfg = load_state()
+    if initial_input:
+        cfg.spline_nlelem = initial_input
     c = THEME
     scale = enable_hidpi()
 
@@ -714,6 +747,11 @@ def launch_gui() -> None:
         background=c["accent"], troughcolor=c["surface"],
         bordercolor=c["surface"], lightcolor=c["accent"], darkcolor=c["accent"],
     )
+    style.configure(
+        "Brand.Horizontal.TScale",
+        background=c["surface"], troughcolor=c["field"],
+        bordercolor=c["hairline"], lightcolor=c["accent"], darkcolor=c["accent"],
+    )
 
     # ---------------- header ----------------
     header = tk.Frame(root, bg=c["brand"])
@@ -756,8 +794,7 @@ def launch_gui() -> None:
         "lift_speed": tk.DoubleVar(value=cfg.lift_speed),
         "rolling_friction": tk.DoubleVar(value=cfg.rolling_friction),
         "drag_coeff": tk.DoubleVar(value=cfg.drag_coeff),
-        "curvature_window_s": tk.DoubleVar(value=cfg.curvature_window_s),
-        "curvature_baseline_m": tk.DoubleVar(value=cfg.curvature_baseline_m),
+        "smoothing": tk.IntVar(value=cfg.smoothing),
         "car_mesh_asset": tk.StringVar(value=cfg.car_mesh_asset),
         "car_mesh_file": tk.StringVar(value=cfg.car_mesh_file),
         "car_forward_axis": tk.StringVar(value=cfg.car_forward_axis),
@@ -779,12 +816,6 @@ def launch_gui() -> None:
         "axis_mapping": tk.StringVar(value=cfg.axis_mapping),
         "samples_per_segment": tk.IntVar(value=cfg.samples_per_segment),
         "resample_spacing_m": tk.DoubleVar(value=cfg.resample_spacing_m),
-        "spike_filter_enabled": tk.BooleanVar(value=cfg.spike_filter_enabled),
-        "spike_angle_threshold_deg": tk.DoubleVar(value=cfg.spike_angle_threshold_deg),
-        "spike_deviation_multiplier": tk.DoubleVar(value=cfg.spike_deviation_multiplier),
-        "spike_max_passes": tk.IntVar(value=cfg.spike_max_passes),
-        "segment_distortion_ratio": tk.DoubleVar(value=cfg.segment_distortion_ratio),
-        "tangent_break_threshold_deg": tk.DoubleVar(value=cfg.tangent_break_threshold_deg),
     }
 
     # A hand-rolled tab strip rather than ttk.Notebook: clam shifts the selected
@@ -906,6 +937,80 @@ def launch_gui() -> None:
             ttk.Entry(
                 holder, textvariable=vars_dict[key], style="Field.TEntry"
             ).pack(fill=tk.X)
+
+    def add_slider_row(parent, row, label, key, hint, lo, hi, ends):
+        """A full-width slider with a live readout and labelled ends.
+
+        Smoothing is a feel setting - you nudge it and look at the peak G - so
+        it gets a slider rather than a number box. The readout keeps the exact
+        value visible, because a bare slider is impossible to return to a
+        setting you liked.
+        """
+        holder = tk.Frame(parent, bg=c["surface"])
+        holder.grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(0, px(16))
+        )
+        holder.columnconfigure(0, weight=1)
+
+        head = tk.Frame(holder, bg=c["surface"])
+        head.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            head, text=label, bg=c["surface"], fg=c["fg"], font=(FONT_TEXT, 10)
+        ).pack(side=tk.LEFT)
+        readout = tk.Label(
+            head, bg=c["surface"], fg=c["accent"], font=(FONT, 10, "bold")
+        )
+        readout.pack(side=tk.RIGHT)
+
+        var = vars_dict[key]
+        scale = ttk.Scale(
+            holder, from_=lo, to=hi, orient=tk.HORIZONTAL,
+            style="Brand.Horizontal.TScale",
+        )
+        scale.grid(row=1, column=0, sticky="ew", pady=(px(6), 0))
+
+        ends_row = tk.Frame(holder, bg=c["surface"])
+        ends_row.grid(row=2, column=0, sticky="ew")
+        tk.Label(
+            ends_row, text=ends[0], bg=c["surface"], fg=c["faint"],
+            font=(FONT_TEXT, 8),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            ends_row, text=ends[1], bg=c["surface"], fg=c["faint"],
+            font=(FONT_TEXT, 8),
+        ).pack(side=tk.RIGHT)
+
+        tk.Label(
+            holder, text=hint, bg=c["surface"], fg=c["muted"],
+            font=(FONT_TEXT, 8), wraplength=px(900), justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(px(5), 0))
+
+        # ttk.Scale is a float widget; the setting is an integer. Round on the
+        # way in so dragging cannot leave 14.7 in a config file.
+        syncing = {"busy": False}
+
+        def on_drag(raw):
+            if syncing["busy"]:
+                return
+            value = int(round(float(raw)))
+            if value != var.get():
+                var.set(value)
+            readout.configure(text=str(value))
+
+        def on_var(*_args):
+            syncing["busy"] = True
+            try:
+                value = int(round(float(var.get())))
+            except (TypeError, ValueError, tk.TclError):
+                value = lo
+            value = max(lo, min(hi, value))
+            scale.set(value)
+            readout.configure(text=str(value))
+            syncing["busy"] = False
+
+        scale.configure(command=on_drag)
+        var.trace_add("write", on_var)
+        on_var()
 
     def add_toggle(parent, row, text, key):
         """A hand-drawn checkbox: clam's indicator does not scale cleanly."""
@@ -1085,18 +1190,21 @@ def launch_gui() -> None:
         "Speed lost to air resistance. Higher slows the ride down.",
     )
     add_value_row(
-        physics, 1, 1, "Curvature window (s)", "curvature_window_s",
-        "Time window used to measure how sharply the track bends.",
-    )
-    add_value_row(
-        physics, 2, 0, "Curvature floor (m)", "curvature_baseline_m",
-        "Shortest distance used to measure how sharply the track bends.",
-    )
-    add_value_row(
-        physics, 2, 1, "Lift speed (m/s)", "lift_speed",
+        physics, 1, 1, "Lift speed (m/s)", "lift_speed",
         "How fast the chain or launch drives the car up a hill. Gravity alone "
         "cannot get a car up a lift, so without this the climb crawls and the "
         "whole ride comes out slower than it should. Set 0 for gravity only.",
+    )
+    add_section(
+        physics, 2, "SMOOTHING",
+        "How sharp the force readings come out.",
+    )
+    add_slider_row(
+        physics, 3, "Smoothing", "smoothing",
+        "Low keeps every transition sharp and reports the true peak G, which "
+        "is what you want for drops. High averages over metres of track and "
+        "flattens them. Raise it only if the readings look noisy.",
+        0, 100, ("0 - sharp, full detail", "100 - heavily smoothed"),
     )
 
     # ---------------- Geometry ----------------
@@ -1116,61 +1224,6 @@ def launch_gui() -> None:
     add_value_row(
         geometry, 1, 0, "Resample spacing (m)", "resample_spacing_m",
         "Spacing between points along the track.",
-    )
-    add_section(
-        geometry, 2, "TRACK MESH CLEANUP",
-        "Smooths rough spots out of the track shape used for display. The "
-        "physics numbers are not affected. Settings are under Advanced.",
-    )
-    add_toggle(
-        geometry, 3, "Smooth extreme spline spikes and outliers",
-        "spike_filter_enabled",
-    )
-
-    # ---------------- Advanced ----------------
-    advanced = make_tab("Advanced")
-    adv = 0
-    if not IS_FROZEN:
-        add_path_row(
-            advanced, adv, "Python executable", "python_exe",
-            "The Python program used to run the converter.",
-            "file", [("Python", "python*.exe"), ("All", "*.*")],
-        )
-        adv += 1
-
-    add_section(
-        advanced, adv, "SOURCE DEFECT DETECTION",
-        "Parts of the track that look broken in the source file are marked, "
-        "not silently repaired.",
-    )
-    adv += 1
-    add_value_row(
-        advanced, adv, 0, "Segment distortion", "segment_distortion_ratio",
-        "How bent a piece of track must be before it is marked as broken.",
-    )
-    add_value_row(
-        advanced, adv, 1, "Tangent break (deg)", "tangent_break_threshold_deg",
-        "How sharp a corner must be before it is marked as broken.",
-    )
-    adv += 1
-
-    add_section(
-        advanced, adv, "SPIKE FILTER TUNING",
-        "Used only when track mesh cleanup is turned on, on the Geometry tab.",
-    )
-    adv += 1
-    add_value_row(
-        advanced, adv, 0, "Angle threshold (deg)", "spike_angle_threshold_deg",
-        "How sharp a kink must be before it is smoothed.",
-    )
-    add_value_row(
-        advanced, adv, 1, "Deviation multiplier", "spike_deviation_multiplier",
-        "How far a point must sit off the track before it is smoothed.",
-    )
-    adv += 1
-    add_value_row(
-        advanced, adv, 0, "Max passes", "spike_max_passes",
-        "How many times to repeat the smoothing.", "spin", from_=1, to=10,
     )
 
     # ---------------- actions ----------------
@@ -1268,8 +1321,7 @@ def launch_gui() -> None:
             lift_speed=num("lift_speed", float),
             rolling_friction=num("rolling_friction", float),
             drag_coeff=num("drag_coeff", float),
-            curvature_window_s=num("curvature_window_s", float),
-            curvature_baseline_m=num("curvature_baseline_m", float),
+            smoothing=num("smoothing", int),
             car_mesh_asset=vars_dict["car_mesh_asset"].get().strip(),
             car_mesh_file=vars_dict["car_mesh_file"].get().strip(),
             car_forward_axis=vars_dict["car_forward_axis"].get().strip(),
@@ -1291,12 +1343,6 @@ def launch_gui() -> None:
             axis_mapping=vars_dict["axis_mapping"].get().strip(),
             samples_per_segment=num("samples_per_segment", int),
             resample_spacing_m=num("resample_spacing_m", float),
-            spike_filter_enabled=bool(vars_dict["spike_filter_enabled"].get()),
-            spike_angle_threshold_deg=num("spike_angle_threshold_deg", float),
-            spike_deviation_multiplier=num("spike_deviation_multiplier", float),
-            spike_max_passes=num("spike_max_passes", int),
-            segment_distortion_ratio=num("segment_distortion_ratio", float),
-            tangent_break_threshold_deg=num("tangent_break_threshold_deg", float),
         )
 
     def background_run(run_cfg: PipelineConfig):
@@ -1353,12 +1399,7 @@ def launch_gui() -> None:
         if not out.exists():
             messagebox.showwarning(APP_NAME, "Output folder does not exist yet.")
             return
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", str(out)])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(out)])
-        else:
-            subprocess.Popen(["xdg-open", str(out)])
+        subprocess.Popen(["explorer", str(out)])
 
     run_btn.configure(command=on_run)
     save_btn.configure(command=on_save)
@@ -1437,6 +1478,25 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+SOURCE_SUFFIXES = {".nlelem", ".nl2elem", ".csv"}
+
+
+def initial_input_from(extra: list[str]) -> str | None:
+    """Pick a source file out of leftover argv, e.g. from a double-click.
+
+    Windows passes the clicked path as a bare argument. Anything that is not an
+    existing file with a format the converter reads is ignored rather than
+    silently loaded as a spline.
+    """
+    for candidate in extra:
+        if candidate.startswith("-"):
+            continue
+        path = Path(candidate)
+        if path.suffix.lower() in SOURCE_SUFFIXES and path.is_file():
+            return str(path)
+    return None
+
+
 def main() -> int:
     args = parse_args()
     if args.internal_convert:
@@ -1452,7 +1512,7 @@ def main() -> int:
     if args.headless_run:
         return run_pipeline(load_state(), print)
 
-    launch_gui()
+    launch_gui(initial_input_from(args.extra_args))
     return 0
 
 

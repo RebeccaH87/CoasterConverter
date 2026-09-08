@@ -212,24 +212,79 @@ undriven stretches - it is no longer what carries the train uphill.
 
 Three things make the force numbers meaningful:
 
-1. **Uniform arc-length resampling** (`--resample-spacing-m`, default 0.10).
-   Bezier segments are sampled in uniform parameter `t`, which produces spacing
-   that varies by more than 10x. Differentiating unevenly spaced points biases
-   the result by the spacing itself.
+1. **Curve-following arc-length resampling** (`--resample-spacing-m`, default
+   0.10). Bezier segments are sampled in uniform parameter `t`, which produces
+   spacing that varies by more than 10x, and differentiating unevenly spaced
+   points biases the result by the spacing itself. Interpolation is a cubic
+   Hermite through each pair of stations using the tangents they already carry.
+
+   This is not a detail. Interpolating *linearly* — which is what the converter
+   used to do — turns a smooth curve into a polyline: every interpolated point
+   lands exactly on a chord, so a fifth of the path reads as dead straight and
+   all of the real curvature piles up into kinks at the original stations. On
+   the reference ride that overstated the tightest bend by 153% and left the car
+   holding its heading for whole steps before snapping up to 4 degrees at once —
+   muted motion punctuated by jolts, which is precisely how it looked in Unreal.
+   Hermite reproduces the curve the stations came from, so curvature can be
+   measured close-in and the detail survives.
 
 2. **Circumcircle curvature** rather than `|d(tangent)|/ds`, which divides by a
    length that can approach zero.
 
-3. **A time-matched measurement window** (`--curvature-window-s`, default 0.15).
-   Accelerometers, and CoasterAnalyzer, filter over *time*, so the curvature
-   baseline is `speed * window` rather than a fixed distance. This makes the
-   converter and the in-engine analyzer measure the same physical scale.
+3. **One measurement baseline** (`--smoothing`, 0-100, default 15). Curvature is
+   measured across a real distance, and this sets it — the only smoothing
+   control there is. 0 measures at the path's own resolution and keeps every
+   transition sharp; 100 averages over six metres and flattens everything short
+   of a whole hill.
 
-The spike filter now runs **only** on the render path. It rewrites positions, and
-every position edit changes curvature — a straight-line replacement reads as
-zero curvature (phantom airtime) bracketed by kinks (phantom spikes). The
-analytic path in `samples` is never geometry-edited. `render_path` is the
-filtered copy, and is what the track spline is built from.
+   It used to scale with local speed, on the reasoning that an accelerometer
+   filters over time. The effect was backwards: the fastest parts of the ride —
+   the drops, the only place peak G really matters — were measured across four
+   metres of track and came out smoothest, while the crawl up the lift was
+   measured across one metre and came out sharpest. A fixed distance treats the
+   whole ride alike.
+
+### Outlier removal
+
+Automatic, always on, and deliberately unconfigurable. It deletes only geometry
+that no coaster can have:
+
+| Rejected | Limit |
+|---|---|
+| Impossible bend | radius under 1.0 m |
+| Doubling back | turn over 120 degrees at one station |
+| Duplicate or needle-spaced points | under 1/8 of median station spacing |
+| Non-finite coordinates | any NaN or infinity |
+
+Those are facts about track, not preferences, which is why there is no slider
+for them. The radius test does the real work; the turn test is only a backstop
+for a point thrown far enough to land on a wide arc, and it has to stay generous
+because turn-per-station scales with station spacing. Tightened to 45 degrees it
+deleted 73 of 363 legitimate stations on a reconstructed Bezier path, where an
+ordinary tight helix turns that far between samples.
+
+Removal deletes the offending station and lets the Hermite interpolation bridge
+the hole, taking the *sharpest* station in each run of flagged points so that
+one bad point costs one station rather than its innocent neighbours. The old
+five-stage spike filter instead replaced whole neighbourhoods with straight
+lines — which flattened legitimate tight helices, since those have a low
+chord-to-arc ratio too, and the curvature baseline then had to be widened to
+hide the kinks the flattening left behind.
+
+Because it only ever deletes impossible geometry, the result is safe to share:
+`samples` and `render_path` now derive from the same stations, so the track
+Unreal draws and the track the forces come from are the same track again.
+Missing track is reported and never bridged — inventing it would turn an export
+bug into a plausible-looking ride. A NaN coordinate used to crash the converter
+outright.
+
+### Jolt flagging
+
+Once the timeline is solved, longitudinal jerk above 50 m/s3 is reported with
+its cause. Geometry-driven jolts are already gone by then, so what survives is
+either a real feature of the ride or a boundary in the physics model — most
+often the moment a lift chain takes the load, which is abrupt on a real ride too
+and is left alone rather than smoothed into a lie.
 
 ## Source data defects in this export
 
@@ -695,9 +750,13 @@ Four tabs, LSU purple and gold, dark throughout:
 | **Files** | Track file (required), tangent, output folder, validation reference CSV |
 | **Car** | Car mesh, facing axis, yaw, scale, height offset, expected length, baked FBX |
 | **Track** | Procedural track: gauge, rail drop, detail and tie spacing, supports |
-| **Physics** | Initial speed, rolling friction, drag, curvature window and floor |
-| **Geometry** | Axis mapping, samples per segment, resample spacing, track mesh cleanup |
-| **Advanced** | Python interpreter, source-defect thresholds, spike filter tuning |
+| **Physics** | Initial speed, rolling friction, drag, lift speed, and the Smoothing slider |
+| **Geometry** | Axis mapping, samples per segment, resample spacing |
+
+There is no Advanced tab and no interpreter picker: the converter runs under
+whichever Python is already running the GUI, which is the only value that was
+ever correct. Outlier removal is not listed anywhere in the UI either - it is
+always on, has nothing to set, and reports what it removed in the run log.
 
 Behaviour worth knowing:
 
