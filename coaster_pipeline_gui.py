@@ -1399,7 +1399,12 @@ def launch_gui(initial_input: str | None = None) -> None:
         if not out.exists():
             messagebox.showwarning(APP_NAME, "Output folder does not exist yet.")
             return
-        subprocess.Popen(["explorer", str(out)])
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(out)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(out)])
+        else:
+            subprocess.Popen(["xdg-open", str(out)])
 
     run_btn.configure(command=on_run)
     save_btn.configure(command=on_save)

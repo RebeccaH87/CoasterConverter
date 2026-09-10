@@ -846,6 +846,44 @@ Two bugs fixed here that mattered:
   resolution, quantising the whole ride to 30 ticks per second. The script now
   reads `get_tick_resolution()` and keys against it.
 
+## Packaged builds
+
+One PyInstaller spec covers both platforms, because they differ only in
+packaging shape:
+
+| | Windows | macOS |
+|---|---|---|
+| Artifact | `dist/UE5_CoasterPipeline.exe` | `dist/UE5_CoasterPipeline.app` (+ `.dmg`) |
+| Shape | onefile | onedir inside a `.app` |
+
+macOS gets a `.app` rather than a single binary for two reasons. A one-file
+binary carries no `Info.plist`, so it gets no Dock icon and Tk renders
+bitmap-stretched on Retina. And onefile unpacks its bundled libraries to a temp
+dir at every launch under their original signer, which a hardened-runtime app
+then refuses to load on a Team ID mismatch. Onedir ships real files inside the
+bundle, so one `codesign --deep` covers everything.
+
+```bash
+./build_macos.sh                          # host architecture
+MACOS_TARGET_ARCH=universal2 ./build_macos.sh
+```
+
+```powershell
+pyinstaller --noconfirm UE5_CoasterPipeline.spec
+```
+
+The macOS build needs a Python with a working `tkinter`. Homebrew's python has
+no `_tkinter` unless `python-tk` is installed alongside it; the python.org
+installer and conda both ship Tk. `build_macos.sh` checks up front instead of
+failing deep inside PyInstaller, and stages the build in a temp dir -- if the
+repo sits in an iCloud-synced folder, the file provider keeps re-adding a
+`com.apple.FinderInfo` xattr that makes `codesign --verify --strict` reject the
+bundle as "detritus".
+
+The app is signed ad-hoc unless `MACOS_CODESIGN_IDENTITY` is set. Ad-hoc runs
+fine on the machine that built it; on any other Mac, Gatekeeper wants a
+right-click -> Open once, or `xattr -dr com.apple.quarantine` on the app.
+
 ## Legacy FBX scripts (not called by the GUI)
 
 `blender_build_animated_fbx.py`, `blender_3ds_to_fbx.py` and

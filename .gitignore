@@ -1,0 +1,3 @@
+# The macOS .app is 382 files and is fully reproduced by the .dmg beside it,
+# which is the shippable artifact. Rebuild it with ./build_macos.sh
+dist/UE5_CoasterPipeline.app/
